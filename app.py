@@ -17,7 +17,7 @@ SITUACOES_VALIDAS  = {'não informado', 'uso autorizado', 'doc não gerado'}
 TERMOS_EXCLUSAO    = r'comodato|retorno|devolu[çc][aã]o'
 COLUNAS_EXCLUSAO   = ['Observação', 'Natureza Operação', 'Tipo Documento SAP']
 MAX_DOWNLOAD_MB    = 50
-TIMEOUT_S          = 15
+TIMEOUT_S          = 120
 LIXO               = {'nan', 'none', '', 'nat', '<na>', 'null'}
 ABA_CONTROLE       = 'Controle'
 
@@ -232,7 +232,7 @@ def get_credentials():
         st.stop()
     return Credentials.from_service_account_info(st.secrets["gcp_service_account"], scopes=scopes)
 
-@st.cache_data(show_spinner=False, ttl=30)
+@st.cache_data(show_spinner=False, ttl=300)
 def buscar_planilha_bytes() -> bytes:
     sheet_id = get_sheet_id()
     export_url = f"https://docs.google.com/spreadsheets/d/{sheet_id}/export?format=xlsx"
