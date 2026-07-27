@@ -915,7 +915,6 @@ def render_editavel(df_dados: pd.DataFrame, df_controle: pd.DataFrame, df_nfs, c
             restante = pd.DataFrame(columns=['NF', 'CNPJ', 'Tratado', 'Observacao_Controle', 'Responsavel', 'Atualizado_em'])
         novo_ctrl = pd.concat([restante, nova_linha], ignore_index=True)
         salvar_controle(novo_ctrl)
-        buscar_planilha_bytes.clear()
         st.rerun()
 
     st.divider()
