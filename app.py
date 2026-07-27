@@ -619,16 +619,58 @@ def filtrar_nfs(df_nfs, col_nf, col_cnpj, nf, cnpj):
         return sel_cnpj  # vazio se não confere -> não mostra nada
     return sel
 
+@st.cache_data(show_spinner=False)
+def _descricao_index(df_nfs: pd.DataFrame, col_nf: str, col_cnpj, col_desc: str):
+    """Índice {(nf,cnpj): 'descrições'} e {nf: 'descrições'} construído
+    UMA ÚNICA VEZ. Antes, cada nota da tabela principal escaneava a aba NFs
+    inteira de novo — com centenas de notas x milhares de linhas da NFs,
+    isso é o que deixava a tela lentíssima."""
+    idx_key, idx_nf = {}, {}
+    if df_nfs is None or df_nfs.empty or not col_desc or col_desc not in df_nfs.columns or not col_nf:
+        return idx_key, idx_nf
+    nf_norm = df_nfs[col_nf].map(norm_nf_val)
+    if col_cnpj and col_cnpj in df_nfs.columns:
+        cn_norm = df_nfs[col_cnpj].map(norm_cnpj_val)
+    else:
+        cn_norm = pd.Series('', index=df_nfs.index)
+    desc_col = df_nfs[col_desc].astype(str)
+    for i in df_nfs.index:
+        nf = nf_norm.at[i]
+        if not nf:
+            continue
+        d = desc_col.at[i].strip()
+        if not d or d.lower() in LIXO:
+            continue
+        cn = cn_norm.at[i]
+        for chave, mapa in ((nf, idx_nf), ((nf, cn), idx_key)):
+            lst = mapa.setdefault(chave, [])
+            if d not in lst:
+                lst.append(d)
+    idx_key = {k: ' | '.join(v) for k, v in idx_key.items()}
+    idx_nf  = {k: ' | '.join(v) for k, v in idx_nf.items()}
+    return idx_key, idx_nf
+
 def descricao_da_nf(df_nfs, cols_nfs, nf, cnpj, nome_nota, valor_nota) -> str:
     """Traz a descrição do item/serviço (coluna E da aba NF's) — o campo que explica
     do que se trata a nota.
     1) Casamento EXATO por Nº NF + CNPJ Emitente (mesma chave usada no cruzamento
-       SAP × NFs — é o jeito mais confiável de achar a nota certa).
+       SAP × NFs — é o jeito mais confiável de achar a nota certa), via índice
+       pré-calculado (O(1) por nota, em vez de escanear a aba inteira toda vez).
     2) Se não achar nada por aí, cai para o casamento por NOME do fornecedor + VALOR
        exato (fallback antigo, útil quando a nota não tem NF/CNPJ correspondente)."""
     col_desc = cols_nfs.get('col_desc')
     if df_nfs is None or df_nfs.empty or col_desc is None or col_desc not in df_nfs.columns:
         return ""
+
+    col_nf, col_cnpj = cols_nfs.get('col_nf'), cols_nfs.get('col_cnpj')
+    idx_key, idx_nf = _descricao_index(df_nfs, col_nf, col_cnpj, col_desc)
+    nf_n = norm_nf_val(nf)
+    if nf_n:
+        cn_n = norm_cnpj_val(cnpj)
+        if (nf_n, cn_n) in idx_key:
+            return idx_key[(nf_n, cn_n)]
+        if nf_n in idx_nf:
+            return idx_nf[nf_n]
 
     def _unicas(serie: pd.Series) -> str:
         descricoes = [d.strip() for d in serie.astype(str).tolist()
@@ -638,19 +680,6 @@ def descricao_da_nf(df_nfs, cols_nfs, nf, cnpj, nome_nota, valor_nota) -> str:
             if d not in vistos:
                 vistos.add(d); out.append(d)
         return " | ".join(out)
-
-    # 1) Match exato por Nº NF + CNPJ Emitente
-    col_nf, col_cnpj = cols_nfs.get('col_nf'), cols_nfs.get('col_cnpj')
-    if col_nf is not None and nf:
-        cand = df_nfs[df_nfs[col_nf].map(norm_nf_val) == norm_nf_val(nf)]
-        if col_cnpj is not None and cnpj:
-            cand_cnpj = cand[cand[col_cnpj].map(norm_cnpj_val) == norm_cnpj_val(cnpj)]
-            if not cand_cnpj.empty:
-                cand = cand_cnpj
-        if not cand.empty:
-            desc = _unicas(cand[col_desc])
-            if desc:
-                return desc
 
     # 2) Fallback: nome do fornecedor + valor exato
     col_nome = cols_nfs.get('col_nome')
@@ -677,18 +706,29 @@ def montar_tabela_editavel(df: pd.DataFrame, df_controle: pd.DataFrame, df_nfs=N
     cols = [c for c in COLUNAS_EXIBIR if c in df.columns]
     df_view = df[cols].copy()
 
-    # "Do que se trata" — mesma lógica do painel de detalhes, calculada linha a linha
+    # "Do que se trata" — via índice pré-calculado (uma vez só), lookup O(1) por linha
     if df_nfs is not None and cols_nfs is not None and 'Nº NF' in df.columns:
-        def _desc_linha(row):
-            return descricao_da_nf(
-                df_nfs, cols_nfs,
-                row.get('Nº NF', ''), row.get('CNPJ Emitente', ''),
-                row.get('Razão Social', ''), row.get('Valor Nota Fiscal', ''),
+        idx_key, idx_nf = _descricao_index(df_nfs, cols_nfs.get('col_nf'),
+                                            cols_nfs.get('col_cnpj'), cols_nfs.get('col_desc'))
+        nf_col  = df['Nº NF'].map(norm_nf_val) if 'Nº NF' in df.columns else pd.Series('', index=df.index)
+        cn_col  = df['CNPJ Emitente'].map(norm_cnpj_val) if 'CNPJ Emitente' in df.columns else pd.Series('', index=df.index)
+
+        def _lookup(nf_n, cn_n):
+            if not nf_n:
+                return ""
+            if (nf_n, cn_n) in idx_key:
+                return idx_key[(nf_n, cn_n)]
+            return idx_nf.get(nf_n, "")
+
+        descricoes = [
+            _lookup(nf_n, cn_n) or descricao_da_nf(
+                df_nfs, cols_nfs, df.at[i, 'Nº NF'], df.at[i, 'CNPJ Emitente'],
+                df.at[i, 'Razão Social'] if 'Razão Social' in df.columns else '',
+                df.at[i, 'Valor Nota Fiscal'] if 'Valor Nota Fiscal' in df.columns else '',
             )
-        df_view.insert(
-            min(5, len(df_view.columns)), '📖 Do que se trata',
-            df.apply(_desc_linha, axis=1)
-        )
+            for i, nf_n, cn_n in zip(df.index, nf_col, cn_col)
+        ]
+        df_view.insert(min(5, len(df_view.columns)), '📖 Do que se trata', descricoes)
 
     if not df_controle.empty and {'NF', 'CNPJ'}.issubset(df_controle.columns) and 'Nº NF' in df_view.columns:
         df_ctrl = df_controle[['NF', 'CNPJ', 'Tratado', 'Observacao_Controle']].copy()
