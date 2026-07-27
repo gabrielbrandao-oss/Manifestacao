@@ -56,18 +56,12 @@ ABA_NFS_CAND        = ["NFs", "NF's", "NF´s", "NFES", "NFE", "NF-e", "NF", "NOT
 COLUNAS_EXIBIR = [
     'Nº NF',
     'CNPJ Emitente',
-    'Chave de Acesso',
     'Razão Social',
-    'Centro de Custo',
     'Valor Nota Fiscal',
     'Situação Manifestação',
-    'Manifestação Qive',
-    'Conferência Manifestação',
-    'Conferência SAP×Qive',
-    'Na Qive',
+    'Centro de Custo',
     'Na NFs',
-    'Nas 3 abas',
-    'Status Cruzamento',
+    'Chave de Acesso',
 ]
 
 st.set_page_config(page_title="Manifestações NF-e", layout="wide")
@@ -297,21 +291,43 @@ def salvar_controle(df_controle: pd.DataFrame):
 # PROCESSAMENTO  —  CRUZAMENTO POR CHAVE DE ACESSO
 # ═══════════════════════════════════════════════════════════
 @st.cache_data(show_spinner=False)
-def _centro_custo_index(file_bytes: bytes):
+def _parse_planilha(file_bytes: bytes):
+    """Abre o workbook e lê TODAS as abas usadas de uma vez só (SAP, Qive se
+    existir, e NFs). Cada 'pd.read_excel' reprocessa a tabela de strings
+    compartilhadas do ARQUIVO INTEIRO mesmo pra ler uma aba só — e como a aba
+    NFs ficou enorme (formato Arquivei), isso sozinho já é lento. Abrir na mão
+    3-4 vezes (SAP, tentativa de Qive, NFs, de novo NFs) era o que travava
+    o app. Agora só se abre uma vez, cacheado por conteúdo do arquivo."""
+    xls = pd.ExcelFile(io.BytesIO(file_bytes), engine='openpyxl')
+    sheet_names = list(xls.sheet_names)
+
+    df_sap = pd.read_excel(xls, sheet_name='SAP', dtype=str) if 'SAP' in sheet_names else pd.DataFrame()
+
+    aba_qive = achar_aba(sheet_names, ['Qive', 'QIVE'])
+    df_qive = pd.read_excel(xls, sheet_name=aba_qive, dtype=str) if aba_qive else pd.DataFrame()
+
+    aba_nfs = achar_aba(sheet_names, ABA_NFS_CAND)
+    df_nfs = pd.read_excel(xls, sheet_name=aba_nfs, dtype=str) if aba_nfs else pd.DataFrame()
+
+    return {
+        'sheet_names': sheet_names,
+        'df_sap': df_sap,
+        'df_qive': df_qive, 'aba_qive': aba_qive,
+        'df_nfs': df_nfs, 'aba_nfs': aba_nfs,
+    }
+
+def _centro_custo_index(df_nfs: pd.DataFrame):
     """Constrói {nf|cnpj: 'CC1 | CC2'} a partir da aba NFs."""
     try:
-        xls = pd.ExcelFile(io.BytesIO(file_bytes), engine='openpyxl')
-        aba = achar_aba(list(xls.sheet_names), ABA_NFS_CAND)
-        if aba is None:
+        if df_nfs is None or df_nfs.empty:
             return {}
-        df = pd.read_excel(xls, sheet_name=aba, dtype=str)
-        col_nf   = achar_coluna(df, COL_NF_NFS_CAND)
-        col_cnpj = achar_coluna(df, COL_CNPJ_NFS_CAND)
-        col_cc   = achar_coluna(df, COL_CC_CAND)
+        col_nf   = achar_coluna(df_nfs, COL_NF_NFS_CAND)
+        col_cnpj = achar_coluna(df_nfs, COL_CNPJ_NFS_CAND)
+        col_cc   = achar_coluna(df_nfs, COL_CC_CAND)
         if col_nf is None or col_cc is None:
             return {}
         idx = {}
-        for _, r in df.iterrows():
+        for _, r in df_nfs.iterrows():
             nf = norm_nf_val(r.get(col_nf, ''))
             cn = norm_cnpj_val(r.get(col_cnpj, '')) if col_cnpj else ''
             cc = str(r.get(col_cc, '')).strip()
@@ -325,8 +341,8 @@ def _centro_custo_index(file_bytes: bytes):
     except Exception:
         return {}
 
-def _mapa_centro_custo(file_bytes: bytes, df_merge: pd.DataFrame) -> pd.Series:
-    idx = _centro_custo_index(file_bytes)
+def _mapa_centro_custo(df_nfs: pd.DataFrame, df_merge: pd.DataFrame) -> pd.Series:
+    idx = _centro_custo_index(df_nfs)
     if not idx:
         return pd.Series('', index=df_merge.index)
     nf = df_merge.get('Nº NF', pd.Series('', index=df_merge.index)).map(norm_nf_val)
@@ -334,35 +350,47 @@ def _mapa_centro_custo(file_bytes: bytes, df_merge: pd.DataFrame) -> pd.Series:
     chaves = nf + '|' + cn
     return chaves.map(lambda k: idx.get(k, ''))
 
-@st.cache_data(show_spinner=False)
-def _nfs_index(file_bytes: bytes):
+def _nfs_index(df_nfs: pd.DataFrame):
     """Índices da aba NFs para checar presença por CNPJ, NF, valor e nome."""
     try:
-        xls = pd.ExcelFile(io.BytesIO(file_bytes), engine='openpyxl')
-        aba = achar_aba(list(xls.sheet_names), ABA_NFS_CAND)
-        if aba is None:
+        if df_nfs is None or df_nfs.empty:
             return None
-        df = pd.read_excel(xls, sheet_name=aba, dtype=str)
-        col_nf   = achar_coluna(df, COL_NF_NFS_CAND)
-        col_cnpj = achar_coluna(df, COL_CNPJ_NFS_CAND)
-        col_nome = achar_coluna(df, COL_NOME_NFS_CAND)
-        col_va   = achar_coluna(df, ['Total da linha'])
-        col_vb   = achar_coluna(df, ['Total documento'])
-        set_nf   = set(df[col_nf].map(norm_nf_val))   if col_nf   else set()
-        set_cnpj = set(df[col_cnpj].map(norm_cnpj_val)) if col_cnpj else set()
-        nomes    = [_limpa_nome(x) for x in df[col_nome].astype(str)] if col_nome else []
+        col_nf   = achar_coluna(df_nfs, COL_NF_NFS_CAND)
+        col_cnpj = achar_coluna(df_nfs, COL_CNPJ_NFS_CAND)
+        col_nome = achar_coluna(df_nfs, COL_NOME_NFS_CAND)
+        col_va   = achar_coluna(df_nfs, ['Total da linha'])
+        col_vb   = achar_coluna(df_nfs, ['Total documento'])
+        set_nf   = set(df_nfs[col_nf].map(norm_nf_val))   if col_nf   else set()
+        set_cnpj = set(df_nfs[col_cnpj].map(norm_cnpj_val)) if col_cnpj else set()
+        nomes    = [_limpa_nome(x) for x in df_nfs[col_nome].astype(str)] if col_nome else []
         vals = set()
         for c in (col_va, col_vb):
             if c:
-                vals |= {v for v in df[c].map(norm_valor) if v is not None}
-        return {'nf': set_nf, 'cnpj': set_cnpj, 'nomes': [n for n in nomes if n], 'vals': vals}
+                vals |= {v for v in df_nfs[c].map(norm_valor) if v is not None}
+        return {'nf': set_nf, 'cnpj': set_cnpj, 'nomes': list(set(n for n in nomes if n)), 'vals': vals}
     except Exception:
         return None
 
-def _presenca_nfs(file_bytes: bytes, df_merge: pd.DataFrame) -> pd.Series:
+def _nome_parecido_de_lista(nome_limpo: str, nomes_limpos: list) -> bool:
+    """Mesma regra de _nomes_parecidos, mas recebendo nomes JÁ limpos
+    (evita rechamar _limpa_nome milhares de vezes por linha)."""
+    if not nome_limpo:
+        return True
+    sa = set(nome_limpo.split())
+    for nb in nomes_limpos:
+        if not nb:
+            continue
+        if nome_limpo == nb or nome_limpo in nb or nb in nome_limpo:
+            return True
+        sb = set(nb.split())
+        if sa and sb and len(sa & sb) / min(len(sa), len(sb)) >= 0.6:
+            return True
+    return False
+
+def _presenca_nfs(df_nfs: pd.DataFrame, df_merge: pd.DataFrame) -> pd.Series:
     """Marca True quando a nota também aparece na aba NFs, batendo pelos campos
     disponíveis (CNPJ, Nº NF, valor e nome do fornecedor)."""
-    idx = _nfs_index(file_bytes)
+    idx = _nfs_index(df_nfs)
     if not idx:
         return pd.Series(False, index=df_merge.index)
     res = []
@@ -373,28 +401,36 @@ def _presenca_nfs(file_bytes: bytes, df_merge: pd.DataFrame) -> pd.Series:
         val  = norm_valor(r.get('Valor Nota Fiscal', ''))
         nome = _limpa_nome(r.get('Razão Social', ''))
         # precisa identificar o fornecedor (CNPJ ou nome) E confirmar por NF ou valor
-        forn_ok = (cn and cn in idx['cnpj']) or any(_nomes_parecidos(nome, n) for n in nomes_nfs)
+        forn_ok = (cn and cn in idx['cnpj']) or _nome_parecido_de_lista(nome, nomes_nfs)
         doc_ok  = (nf and nf in idx['nf']) or (val is not None and val in idx['vals'])
         res.append(bool(forn_ok and doc_ok))
     return pd.Series(res, index=df_merge.index)
 
 @st.cache_data(show_spinner=False)
 def processar(file_bytes: bytes):
-    df_sap  = pd.read_excel(io.BytesIO(file_bytes), sheet_name='SAP',  dtype=str, engine='openpyxl')
-    df_qive = pd.read_excel(io.BytesIO(file_bytes), sheet_name='Qive', dtype=str, engine='openpyxl')
+    dados = _parse_planilha(file_bytes)
+    df_sap  = dados['df_sap'].copy()
+    df_qive = dados['df_qive'].copy()
+    aba_qive_existe = dados['aba_qive'] is not None and not df_qive.empty
+    if df_sap.empty:
+        st.error("Aba 'SAP' não encontrada na planilha.")
+        st.stop()
 
     # Colunas (tolerante)
     col_nf_sap    = achar_coluna_ou_erro(df_sap,  COL_NF_SAP_CAND,   'SAP',  'número da NF ("Nº NF")')
     col_cnpj_sap  = achar_coluna_ou_erro(df_sap,  COL_CNPJ_SAP_CAND, 'SAP',  'CNPJ/CPF emitente')
-    col_nf_qive   = achar_coluna_ou_erro(df_qive, COL_NF_QIVE_CAND,  'Qive', 'número da NF ("Número")')
-    col_cnpj_qive = achar_coluna(df_qive, COL_CNPJ_QIVE_CAND)
-    col_cpf_qive  = achar_coluna(df_qive, COL_CPF_QIVE_CAND)
+    if aba_qive_existe:
+        col_nf_qive   = achar_coluna_ou_erro(df_qive, COL_NF_QIVE_CAND,  'Qive', 'número da NF ("Número")')
+        col_cnpj_qive = achar_coluna(df_qive, COL_CNPJ_QIVE_CAND)
+        col_cpf_qive  = achar_coluna(df_qive, COL_CPF_QIVE_CAND)
+    else:
+        col_nf_qive = col_cnpj_qive = col_cpf_qive = None
 
     for c in ['Situação Manifestação', 'Tipo Doc. Fiscal', 'Chave de Acesso']:
         if c not in df_sap.columns:
             st.error(f"Aba 'SAP' está sem a coluna obrigatória: {c}.")
             st.stop()
-    if 'Chave de acesso' not in df_qive.columns:
+    if aba_qive_existe and 'Chave de acesso' not in df_qive.columns:
         st.error("Aba 'Qive' está sem a coluna obrigatória: Chave de acesso.")
         st.stop()
 
@@ -407,13 +443,16 @@ def processar(file_bytes: bytes):
     df_sap['CNPJ Emitente'] = norm_cnpj(df_sap[col_cnpj_sap])
 
     # Qive: número, chave e documento (CNPJ; se vazio, CPF)
-    df_qive['Número NF'] = norm_nf(df_qive[col_nf_qive])
-    df_qive['_chave']    = norm_chave(df_qive['Chave de acesso'])
-    doc_q = norm_cnpj(df_qive[col_cnpj_qive]) if col_cnpj_qive else pd.Series('', index=df_qive.index)
-    if col_cpf_qive is not None:
-        cpf_q = norm_cnpj(df_qive[col_cpf_qive])
-        doc_q = doc_q.where(doc_q.str.len() > 0, cpf_q)
-    df_qive['CNPJ NF'] = doc_q
+    if aba_qive_existe:
+        df_qive['Número NF'] = norm_nf(df_qive[col_nf_qive])
+        df_qive['_chave']    = norm_chave(df_qive['Chave de acesso'])
+        doc_q = norm_cnpj(df_qive[col_cnpj_qive]) if col_cnpj_qive else pd.Series('', index=df_qive.index)
+        if col_cpf_qive is not None:
+            cpf_q = norm_cnpj(df_qive[col_cpf_qive])
+            doc_q = doc_q.where(doc_q.str.len() > 0, cpf_q)
+        df_qive['CNPJ NF'] = doc_q
+    else:
+        df_qive = pd.DataFrame(columns=['Número NF', '_chave', 'CNPJ NF', 'Chave de acesso'])
 
     # Filtro base (escopo)
     mask_nfe = df_sap['Tipo Doc. Fiscal'].astype(str).str.strip().str.lower() == 'nf-e'
@@ -510,12 +549,12 @@ def processar(file_bytes: bytes):
     ]
 
     # ── CENTRO DE CUSTO (vem da aba NFs, casando por NF + CNPJ) ──
-    df_merge['Centro de Custo'] = _mapa_centro_custo(file_bytes, df_merge)
+    df_merge['Centro de Custo'] = _mapa_centro_custo(dados['df_nfs'], df_merge)
 
     # ── PRESENÇA NAS 3 ABAS (SAP × Qive × NFs) ──
     # Base é o SAP; 'na Qive' vem do merge; 'na NFs' por nome/CNPJ/NF/valor.
     na_qive = (df_merge['_merge'] == 'both')
-    na_nfs  = _presenca_nfs(file_bytes, df_merge)
+    na_nfs  = _presenca_nfs(dados['df_nfs'], df_merge)
     df_merge['Na Qive'] = na_qive.map({True: 'Sim', False: 'Não'})
     df_merge['Na NFs']  = na_nfs.map({True: 'Sim', False: 'Não'})
     df_merge['Nas 3 abas'] = (na_qive & na_nfs).map({True: '✅ Sim (SAP+Qive+NFs)', False: '⚠️ Não'})
@@ -547,14 +586,12 @@ def processar(file_bytes: bytes):
 @st.cache_data(show_spinner=False)
 def carregar_nfs(file_bytes: bytes):
     try:
-        xls = pd.ExcelFile(io.BytesIO(file_bytes), engine='openpyxl')
-        sheet_names = list(xls.sheet_names)
-        aba = achar_aba(sheet_names, ABA_NFS_CAND)
+        dados = _parse_planilha(file_bytes)
+        df, aba, sheet_names = dados['df_nfs'], dados['aba_nfs'], dados['sheet_names']
         vazio = {'col_nf': None, 'col_cnpj': None, 'col_desc': None,
                  'col_nome': None, 'col_val_a': None, 'col_val_b': None}
         if aba is None:
             return pd.DataFrame(), vazio, None, sheet_names, None
-        df = pd.read_excel(xls, sheet_name=aba, dtype=str)
         cols = {
             'col_nf':   achar_coluna(df, COL_NF_NFS_CAND),
             'col_cnpj': achar_coluna(df, COL_CNPJ_NFS_CAND),
@@ -636,9 +673,22 @@ def descricao_da_nf(df_nfs, cols_nfs, nf, cnpj, nome_nota, valor_nota) -> str:
 # ═══════════════════════════════════════════════════════════
 # INTERFACE
 # ═══════════════════════════════════════════════════════════
-def montar_tabela_editavel(df: pd.DataFrame, df_controle: pd.DataFrame) -> pd.DataFrame:
+def montar_tabela_editavel(df: pd.DataFrame, df_controle: pd.DataFrame, df_nfs=None, cols_nfs=None) -> pd.DataFrame:
     cols = [c for c in COLUNAS_EXIBIR if c in df.columns]
     df_view = df[cols].copy()
+
+    # "Do que se trata" — mesma lógica do painel de detalhes, calculada linha a linha
+    if df_nfs is not None and cols_nfs is not None and 'Nº NF' in df.columns:
+        def _desc_linha(row):
+            return descricao_da_nf(
+                df_nfs, cols_nfs,
+                row.get('Nº NF', ''), row.get('CNPJ Emitente', ''),
+                row.get('Razão Social', ''), row.get('Valor Nota Fiscal', ''),
+            )
+        df_view.insert(
+            min(5, len(df_view.columns)), '📖 Do que se trata',
+            df.apply(_desc_linha, axis=1)
+        )
 
     if not df_controle.empty and {'NF', 'CNPJ'}.issubset(df_controle.columns) and 'Nº NF' in df_view.columns:
         df_ctrl = df_controle[['NF', 'CNPJ', 'Tratado', 'Observacao_Controle']].copy()
@@ -723,50 +773,34 @@ def filtros(df: pd.DataFrame, key: str) -> pd.DataFrame:
 
 def painel_detalhes(registro: pd.Series, nf, cnpj, df_nfs, cols_nfs):
     st.markdown("#### 📑 Dados da nota selecionada")
-    campos = ['Nº NF', 'CNPJ Emitente', 'Chave de Acesso', 'Razão Social', 'Centro de Custo',
-              'Valor Nota Fiscal', 'Situação Manifestação', 'Manifestação Qive',
-              'Data Manif. Qive', 'Conferência Manifestação', 'Conferência SAP×Qive',
-              'Na Qive', 'Na NFs', 'Nas 3 abas', 'Status Cruzamento']
+    campos = ['Nº NF', 'CNPJ Emitente', 'Razão Social', 'Valor Nota Fiscal',
+              'Situação Manifestação']
     kv = []
     for c in campos:
         if c in registro.index:
             val = str(registro[c]).strip()
             if val and val.lower() not in LIXO:
                 kv.append({'Campo': c, 'Valor': val})
-    if kv:
-        st.dataframe(pd.DataFrame(kv), hide_index=True, use_container_width=True)
 
-    # ── "Do que se trata esta nota" — Descrição do item/serviço (coluna E da aba NF's) ──
+    # "Do que se trata" — Descrição do item/serviço (coluna E da aba NF's) —
+    # entra como mais uma linha da MESMA tabela, junto com os dados da nota.
     nome_nota  = str(registro.get('Razão Social', ''))
     valor_nota = registro.get('Valor Nota Fiscal', '')
     desc = descricao_da_nf(df_nfs, cols_nfs, nf, cnpj, nome_nota, valor_nota)
-    st.markdown("**📖 Do que se trata esta nota**")
-    if desc:
-        st.info(desc)
-    else:
-        st.caption("Não encontrei a descrição do item/serviço para esta nota na aba NF's.")
+    kv.append({
+        'Campo': '📖 Do que se trata',
+        'Valor': desc if desc else "Não encontrada na aba NF's."
+    })
 
-    # Destaque do double-check da manifestação
-    conf = str(registro.get('Conferência Manifestação', '')).strip()
-    if conf.startswith('⚠️'):
-        st.warning(f"Manifestação: {conf}  —  SAP: '{registro.get('Situação Manifestação','')}' · "
-                   f"Qive: '{registro.get('Manifestação Qive','')}'")
-    elif conf.startswith('✅'):
-        st.success(f"Manifestação: {conf}")
-
-    # Destaque do double-check SAP x Qive (NF + nome + CNPJ)
-    confsq = str(registro.get('Conferência SAP×Qive', '')).strip()
-    if confsq.startswith('⚠️'):
-        st.warning(f"SAP × Qive: {confsq}")
-    elif confsq.startswith('✅'):
-        st.success(f"SAP × Qive: {confsq}")
+    if kv:
+        st.dataframe(pd.DataFrame(kv), hide_index=True, use_container_width=True)
 
 def render_editavel(df_dados: pd.DataFrame, df_controle: pd.DataFrame, df_nfs, cols_nfs,
                     key: str, nome_export: str, responsavel: str):
     df_filtrado = filtros(df_dados, key).reset_index(drop=True)
     st.caption(f"{len(df_filtrado)} registro(s) — clique numa linha para abrir os detalhes abaixo")
 
-    df_view = montar_tabela_editavel(df_filtrado, df_controle).reset_index(drop=True)
+    df_view = montar_tabela_editavel(df_filtrado, df_controle, df_nfs, cols_nfs).reset_index(drop=True)
 
     event = st.dataframe(
         df_view,
@@ -907,12 +941,12 @@ def main():
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Escopo Analítico", len(df_merge))
     c2.metric("Pendências", len(df_pend))
-    c3.metric("SAP sem par na Qive", int((df_merge.get('Status Cruzamento', pd.Series(dtype=str)).astype(str).str.startswith('No SAP')).sum()))
+    c3.metric("Presentes na aba NFs", int((df_merge.get('Na NFs', pd.Series(dtype=str)) == 'Sim').sum()))
     c4.metric("Descartados (Lógica de Negócio)", len(df_excl))
 
     t1, t2, t3, t4, t5 = st.tabs([
         f"⚠️ Pendências ({len(df_pend)})",
-        f"📄 Cruzamento SAP × Qive ({len(df_merge)})",
+        f"📄 Notas SAP ({len(df_merge)})",
         f"📂 Fora do Escopo ({len(df_fora)})",
         f"📦 Excluídos ({len(df_excl)})",
         "🔎 Detalhes da NF",
