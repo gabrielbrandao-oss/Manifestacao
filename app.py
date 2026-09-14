@@ -968,6 +968,22 @@ def render_detalhes_nf(df_nfs, cols_nfs, aba_real, sheet_names, erro):
     st.dataframe(detalhe, hide_index=True, use_container_width=True)
     btn_exportar(detalhe, f"NF_{nf_sel}")
 
+def filtrar_tratados(df: pd.DataFrame, df_controle: pd.DataFrame) -> pd.DataFrame:
+    """Retorna apenas as notas marcadas como Tratado na aba Controle."""
+    if (df is None or df.empty or df_controle is None or df_controle.empty
+            or not {'NF', 'CNPJ', 'Tratado'}.issubset(df_controle.columns)):
+        return df.iloc[0:0].copy() if df is not None else pd.DataFrame()
+    ctrl = df_controle.copy()
+    trat = ctrl['Tratado'].map(lambda x: x is True or str(x).strip().lower() == 'true')
+    chaves = set((ctrl.loc[trat, 'NF'].map(norm_nf_val) + '|'
+                  + ctrl.loc[trat, 'CNPJ'].map(norm_cnpj_val)).tolist())
+    if not chaves:
+        return df.iloc[0:0].copy()
+    cn = df['CNPJ Emitente'] if 'CNPJ Emitente' in df.columns else pd.Series('', index=df.index)
+    k = df['Nº NF'].map(norm_nf_val) + '|' + cn.map(norm_cnpj_val)
+    return df[k.isin(chaves)].copy()
+
+
 def main():
     with st.sidebar:
         st.header("Auditoria")
@@ -992,9 +1008,11 @@ def main():
     c3.metric("Presentes na aba NFs", int((df_merge.get('Na NFs', pd.Series(dtype=str)) == 'Sim').sum()))
     c4.metric("Descartados (Lógica de Negócio)", len(df_excl))
 
-    t1, t2, t3, t4, t5 = st.tabs([
+    df_tratados = filtrar_tratados(df_merge, df_controle)
+    t1, t2, t_trat, t3, t4, t5 = st.tabs([
         f"⚠️ Pendências ({len(df_pend)})",
         f"📄 Notas SAP ({len(df_merge)})",
+        f"✅ Tratados ({len(df_tratados)})",
         f"📂 Fora do Escopo ({len(df_fora)})",
         f"📦 Excluídos ({len(df_excl)})",
         "🔎 Detalhes da NF",
@@ -1003,6 +1021,8 @@ def main():
         render_editavel(df_pend, df_controle, df_nfs, cols_nfs, "pend", "pendencias", responsavel)
     with t2:
         render_editavel(df_merge, df_controle, df_nfs, cols_nfs, "merge", "cruzamento_sap_qive", responsavel)
+    with t_trat:
+        render_editavel(df_tratados, df_controle, df_nfs, cols_nfs, "tratados", "tratados", responsavel)
     with t3:
         st.dataframe(df_fora, hide_index=True, use_container_width=True)
         btn_exportar(df_fora, "fora_do_escopo")
