@@ -44,6 +44,14 @@ COL_CC_CAND         = ['Centro de Custos', 'Centro de Custo', 'Centro Custo', 'C
 
 COL_CFOP_CAND       = ['CFOP', 'C.F.O.P', 'Cfop', 'CFOP SAP']
 
+# CFOP de retorno / devolução / conserto → fora do escopo de manifestação.
+# Derivado da base real (campo Natureza Operação = retorno/devolução/conserto).
+CFOP_RETORNO_DEVOLUCAO = {
+    '1909', '2202', '2909',
+    '5202', '5902', '5909', '5910', '5915', '5916', '5949',
+    '6102', '6202', '6556', '6909', '6910', '6915', '6916', '6918', '6949',
+}
+
 # NFs: nome do fornecedor e colunas de valor (para casar por nome + valor)
 COL_NOME_NFS_CAND   = ['Nome PJ Emitente', 'Nome do cliente/fornecedor', 'Nome cliente/fornecedor',
                        'Nome Fornecedor', 'Fornecedor', 'Nome/Razão Social', 'Razão Social', 'Nome']
@@ -465,11 +473,12 @@ def processar(file_bytes: bytes):
     for col in COLUNAS_EXCLUSAO:
         if col in df_no_escopo.columns:
             mask_excl |= df_no_escopo[col].astype(str).str.contains(TERMOS_EXCLUSAO, case=False, na=False)
-    # CFOP contendo o dígito 9 (ex.: 5909, 6949, 6919...) sai do escopo
+    # CFOP de retorno/devolução/conserto sai do escopo
     col_cfop = achar_coluna(df_no_escopo, COL_CFOP_CAND)
     if col_cfop is not None:
-        cfop_tem9 = df_no_escopo[col_cfop].astype(str).str.contains('9', na=False)
-        mask_excl |= cfop_tem9
+        cfop_norm = (df_no_escopo[col_cfop].astype(str)
+                     .str.replace(r'\D', '', regex=True).str.strip())
+        mask_excl |= cfop_norm.isin(CFOP_RETORNO_DEVOLUCAO)
     df_excluidos = df_no_escopo[mask_excl].copy()
     df_ativo     = df_no_escopo[~mask_excl].copy()
 
