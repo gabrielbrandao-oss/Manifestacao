@@ -48,8 +48,8 @@ COL_CFOP_CAND       = ['CFOP', 'C.F.O.P', 'Cfop', 'CFOP SAP']
 # Derivado da base real (campo Natureza Operação = retorno/devolução/conserto).
 CFOP_RETORNO_DEVOLUCAO = {
     '1909', '2202', '2909',
-    '5202', '5902', '5909', '5910', '5915', '5916', '5949',
-    '6102', '6202', '6556', '6909', '6910', '6915', '6916', '6918', '6949',
+    '5202', '5902', '5909', '5910', '5915', '5916',
+    '6202', '6556', '6909', '6910', '6915', '6916', '6918',
 }
 
 # NFs: nome do fornecedor e colunas de valor (para casar por nome + valor)
@@ -984,6 +984,21 @@ def filtrar_tratados(df: pd.DataFrame, df_controle: pd.DataFrame) -> pd.DataFram
     return df[k.isin(chaves)].copy()
 
 
+def remover_tratados(df: pd.DataFrame, df_controle: pd.DataFrame) -> pd.DataFrame:
+    """Remove do df as notas já marcadas como Tratado (ficam só na aba Tratados)."""
+    if (df is None or df.empty or df_controle is None or df_controle.empty
+            or not {'NF', 'CNPJ', 'Tratado'}.issubset(df_controle.columns)):
+        return df
+    trat = df_controle['Tratado'].map(lambda x: x is True or str(x).strip().lower() == 'true')
+    chaves = set((df_controle.loc[trat, 'NF'].map(norm_nf_val) + '|'
+                  + df_controle.loc[trat, 'CNPJ'].map(norm_cnpj_val)).tolist())
+    if not chaves:
+        return df
+    cn = df['CNPJ Emitente'] if 'CNPJ Emitente' in df.columns else pd.Series('', index=df.index)
+    k = df['Nº NF'].map(norm_nf_val) + '|' + cn.map(norm_cnpj_val)
+    return df[~k.isin(chaves)].copy()
+
+
 def main():
     with st.sidebar:
         st.header("Auditoria")
@@ -1004,23 +1019,25 @@ def main():
 
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Escopo Analítico", len(df_merge))
-    c2.metric("Pendências", len(df_pend))
+    c2.metric("Pendências", len(df_pend_ativo))
     c3.metric("Presentes na aba NFs", int((df_merge.get('Na NFs', pd.Series(dtype=str)) == 'Sim').sum()))
     c4.metric("Descartados (Lógica de Negócio)", len(df_excl))
 
     df_tratados = filtrar_tratados(df_merge, df_controle)
+    df_pend_ativo = remover_tratados(df_pend, df_controle)
+    df_merge_ativo = remover_tratados(df_merge, df_controle)
     t1, t2, t_trat, t3, t4, t5 = st.tabs([
-        f"⚠️ Pendências ({len(df_pend)})",
-        f"📄 Notas SAP ({len(df_merge)})",
+        f"⚠️ Pendências ({len(df_pend_ativo)})",
+        f"📄 Notas SAP ({len(df_merge_ativo)})",
         f"✅ Tratados ({len(df_tratados)})",
         f"📂 Fora do Escopo ({len(df_fora)})",
         f"📦 Excluídos ({len(df_excl)})",
         "🔎 Detalhes da NF",
     ])
     with t1:
-        render_editavel(df_pend, df_controle, df_nfs, cols_nfs, "pend", "pendencias", responsavel)
+        render_editavel(df_pend_ativo, df_controle, df_nfs, cols_nfs, "pend", "pendencias", responsavel)
     with t2:
-        render_editavel(df_merge, df_controle, df_nfs, cols_nfs, "merge", "cruzamento_sap_qive", responsavel)
+        render_editavel(df_merge_ativo, df_controle, df_nfs, cols_nfs, "merge", "cruzamento_sap_qive", responsavel)
     with t_trat:
         render_editavel(df_tratados, df_controle, df_nfs, cols_nfs, "tratados", "tratados", responsavel)
     with t3:
