@@ -1017,15 +1017,15 @@ def main():
         df_controle = carregar_controle()
         st.session_state['atualizado_em'] = datetime.now().strftime("%d/%m/%Y %H:%M")
 
+    df_tratados = filtrar_tratados(df_merge, df_controle)
+    df_pend_ativo = remover_tratados(df_pend, df_controle)
+    df_merge_ativo = remover_tratados(df_merge, df_controle)
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Escopo Analítico", len(df_merge))
     c2.metric("Pendências", len(df_pend_ativo))
     c3.metric("Presentes na aba NFs", int((df_merge.get('Na NFs', pd.Series(dtype=str)) == 'Sim').sum()))
     c4.metric("Descartados (Lógica de Negócio)", len(df_excl))
 
-    df_tratados = filtrar_tratados(df_merge, df_controle)
-    df_pend_ativo = remover_tratados(df_pend, df_controle)
-    df_merge_ativo = remover_tratados(df_merge, df_controle)
     t1, t2, t_trat, t3, t4, t5 = st.tabs([
         f"⚠️ Pendências ({len(df_pend_ativo)})",
         f"📄 Notas SAP ({len(df_merge_ativo)})",
