@@ -29,6 +29,16 @@ TIMEOUT_S          = 120
 LIXO               = {'nan', 'none', '', 'nat', '<na>', 'null'}
 ABA_CONTROLE       = 'Controle'
 COLS_CONTROLE      = ['NF', 'CNPJ', 'Tratado', 'Observacao_Controle', 'Responsavel', 'Atualizado_em']
+ABA_HISTORICO      = 'Historico'
+COLS_HISTORICO     = ['Data_Hora', 'NF', 'CNPJ', 'Acao', 'Tratado_Antes', 'Tratado_Depois',
+                      'Observacao', 'Responsavel']
+
+# Prazo de manifestação conclusiva (confirmação, desconhecimento, operação não
+# realizada): 180 dias. Contado a partir da 'Data Documento' do SAP (emissão),
+# já que a planilha não traz a data de autorização.
+COL_DATA_DOC_CAND        = ['Data Documento', 'Data do Documento', 'Data Emissão', 'Data de Emissão', 'Dt. Emissão']
+PRAZO_MANIFESTACAO_DIAS  = 180
+ALERTA_PRAZO_DIAS        = 30   # "vencendo" quando faltam até 30 dias
 
 # ── Colunas usadas (busca tolerante: ignora acento/maiúscula/apóstrofo) ──
 # Cruzamento principal: CHAVE DE ACESSO (SAP 'Chave de Acesso' x Qive 'Chave de acesso')
@@ -108,7 +118,7 @@ html, body, .stApp, .stMarkdown, p, label, input, textarea, button, h1, h2, h3, 
 /* PageHeader */
 .cb-header { display:flex; align-items:flex-end; justify-content:space-between; gap:16px; }
 .cb-brand { font-size:12px; font-weight:600; letter-spacing:.08em; text-transform:uppercase; color:var(--primary); margin-bottom:4px; }
-.cb-title { font-size:24px; line-height:32px; font-weight:600; color:var(--foreground); margin:0; }
+.cb-title, h1.cb-title { font-size:24px !important; line-height:32px !important; font-weight:600 !important; color:var(--foreground); margin:0 !important; padding:0 !important; letter-spacing:-.01em; }
 .cb-sub { font-size:14px; color:var(--muted-foreground); margin-top:4px; }
 
 /* KPI Cards */
@@ -142,7 +152,6 @@ html, body, .stApp, .stMarkdown, p, label, input, textarea, button, h1, h2, h3, 
 .stButton > button:focus-visible, .stDownloadButton > button:focus-visible { box-shadow:0 0 0 3px var(--outline); }
 [data-baseweb="input"], [data-baseweb="select"] > div { border-radius:8px !important; border-color:var(--border) !important; }
 [data-testid="stCheckbox"] label p { white-space:nowrap; }
-[data-testid="stHorizontalBlock"] { align-items:center; }
 
 /* Tabela */
 [data-testid="stDataFrame"] { border:1px solid var(--border); border-radius:10px; overflow:hidden; }
@@ -158,6 +167,9 @@ html, body, .stApp, .stMarkdown, p, label, input, textarea, button, h1, h2, h3, 
 .cb-badge { display:inline-block; border-radius:8px; padding:2px 10px; font-size:12px; font-weight:500; }
 .cb-badge-ok { background:#F0FDFA; color:var(--success); }
 .cb-badge-pend { background:#FFF7ED; color:var(--warning); }
+.cb-hist-item { font-size:13px; color:var(--foreground); padding:6px 0; border-bottom:1px solid var(--border); }
+.cb-hist-item:last-child { border-bottom:none; }
+.cb-hist-quando { color:var(--muted-foreground); font-variant-numeric:tabular-nums; margin-right:10px; }
 .cb-badge-neutro { background:var(--muted); color:var(--muted-foreground); }
 </style>
 """
@@ -209,6 +221,40 @@ def fmt_doc(v) -> str:
     if len(d) == 11:
         return f"{d[:3]}.{d[3:6]}.{d[6:9]}-{d[9:]}"
     return str(v)
+
+def parse_data(s: pd.Series) -> pd.Series:
+    """Datas do SAP chegam como texto: '2026-01-06 00:00:00' (Excel) ou '06/01/2026'."""
+    t = s.astype(str).str.strip()
+    iso = pd.to_datetime(t.where(t.str.match(r'^\d{4}-\d{2}-\d{2}')), errors='coerce', format='mixed')
+    br  = pd.to_datetime(t.where(t.str.match(r'^\d{1,2}/\d{1,2}/\d{4}')), errors='coerce', dayfirst=True, format='mixed')
+    return iso.fillna(br)
+
+def prazo_manifestacao(df: pd.DataFrame) -> pd.DataFrame:
+    """Para cada nota: emissão (dd/mm/aaaa), dias desde a emissão e situação do prazo."""
+    col = achar_coluna(df, COL_DATA_DOC_CAND)
+    out = pd.DataFrame(index=df.index)
+    if col is None:
+        out['Emissão'], out['Dias'], out['Prazo'] = '', pd.NA, ''
+        return out
+    datas = parse_data(df[col])
+    hoje  = pd.Timestamp(agora_br().date())
+    dias  = (hoje - datas.dt.normalize()).dt.days
+    resta = PRAZO_MANIFESTACAO_DIAS - dias
+
+    def _rotulo(r):
+        if pd.isna(r):
+            return ''
+        r = int(r)
+        if r < 0:
+            return f'Vencida há {-r} dia(s)'
+        if r <= ALERTA_PRAZO_DIAS:
+            return f'Vence em {r} dia(s)'
+        return 'No prazo'
+
+    out['Emissão'] = datas.dt.strftime('%d/%m/%Y').fillna('')
+    out['Dias']    = dias.astype('Int64')
+    out['Prazo']   = resta.map(_rotulo)
+    return out
 
 def norm_chave(s: pd.Series) -> pd.Series:
     return s.astype(str).str.replace(r'\D', '', regex=True).str.strip()
@@ -360,15 +406,43 @@ def buscar_planilha_bytes() -> bytes:
         st.error(f"Timeout/SSL: {e}")
         st.stop()
 
-def _ws_controle():
+def _ws(nome: str, colunas: list):
+    """Abre a aba; se não existir, cria já com o cabeçalho."""
     gc = gspread.authorize(get_credentials())
     sh = gc.open_by_key(get_sheet_id())
     try:
-        return sh.worksheet(ABA_CONTROLE)
+        return sh.worksheet(nome)
     except gspread.exceptions.WorksheetNotFound:
-        ws = sh.add_worksheet(title=ABA_CONTROLE, rows=5000, cols=len(COLS_CONTROLE))
-        ws.append_row(COLS_CONTROLE)
+        ws = sh.add_worksheet(title=nome, rows=5000, cols=len(colunas))
+        ws.append_row(colunas)
         return ws
+
+def _ws_controle():
+    return _ws(ABA_CONTROLE, COLS_CONTROLE)
+
+def _ws_historico():
+    return _ws(ABA_HISTORICO, COLS_HISTORICO)
+
+@st.cache_data(show_spinner=False, ttl=30)
+def carregar_historico() -> pd.DataFrame:
+    try:
+        dados = _ws_historico().get_all_records(numericise_ignore=['all'])
+        return pd.DataFrame(dados, columns=COLS_HISTORICO) if dados else pd.DataFrame(columns=COLS_HISTORICO)
+    except Exception as e:
+        st.warning(f"Não consegui ler o histórico: {e}")
+        return pd.DataFrame(columns=COLS_HISTORICO)
+
+def _acao_historico(trat_antes: str, trat_depois: str, obs_antes: str, obs_depois: str) -> str:
+    """Descreve a mudança; '' quando nada mudou (não vai para o histórico)."""
+    a = str(trat_antes).strip().lower() == 'true'
+    d = str(trat_depois).strip().lower() == 'true'
+    obs_mudou = str(obs_antes).strip() != str(obs_depois).strip()
+    if a != d:
+        acao = 'Marcou como tratado' if d else 'Desmarcou tratado'
+        return acao + (' + observação' if obs_mudou else '')
+    if obs_mudou:
+        return 'Alterou observação'
+    return ''
 
 @st.cache_data(show_spinner=False, ttl=30)
 def carregar_controle() -> pd.DataFrame:
@@ -421,16 +495,22 @@ def salvar_controle(registros: list) -> bool:
         for reg in registros:
             por_chave[_chave_ctrl(reg['NF'], reg['CNPJ'])] = reg
 
-        atualizar, novas = [], []
+        atualizar, novas, historico = [], [], []
         for k, reg in por_chave.items():
-            n, lin = linha_da_chave.get(k, (None, [''] * len(cab)))
-            lin = list(lin)
+            n, antes = linha_da_chave.get(k, (None, [''] * len(cab)))
+            lin = list(antes)
             for c, v in reg.items():
                 lin[pos[c]] = '' if v is None else str(v)
             if n:
                 atualizar.append({'range': f'A{n}', 'values': [lin]})
             else:
                 novas.append(lin)
+            acao = _acao_historico(antes[pos['Tratado']], lin[pos['Tratado']],
+                                   antes[pos['Observacao_Controle']], lin[pos['Observacao_Controle']])
+            if acao:
+                historico.append([lin[pos['Atualizado_em']], lin[pos['NF']], lin[pos['CNPJ']], acao,
+                                  antes[pos['Tratado']] or 'False', lin[pos['Tratado']],
+                                  lin[pos['Observacao_Controle']], lin[pos['Responsavel']]])
 
         if cab_mudou:
             ws.update(range_name='A1', values=[cab])
@@ -439,11 +519,20 @@ def salvar_controle(registros: list) -> bool:
         if novas:
             ws.append_rows(novas)
         carregar_controle.clear()
-        st.success(f"Controle salvo na planilha ({len(por_chave)} nota(s)).")
-        return True
     except Exception as e:
         st.error(f"Falha ao salvar controle: {e}")
         return False
+
+    # Histórico: só acrescenta (nunca reescreve). Se falhar, o controle já foi
+    # salvo — avisa, mas não desfaz nem bloqueia.
+    if historico:
+        try:
+            _ws_historico().append_rows(historico)
+            carregar_historico.clear()
+        except Exception as e:
+            st.warning(f"Controle salvo, mas o histórico não foi registrado: {e}")
+    st.success(f"Controle salvo na planilha ({len(por_chave)} nota(s)).")
+    return True
 
 # ═══════════════════════════════════════════════════════════
 # PROCESSAMENTO  —  CRUZAMENTO POR CHAVE DE ACESSO
@@ -746,7 +835,7 @@ def processar(file_bytes: bytes):
     })
     # Anexa marca de duplicado na Qive ao status
     if '_dup_qive' in df_merge.columns:
-        dupm = df_merge['_dup_qive'].fillna(False)
+        dupm = df_merge['_dup_qive'].eq(True)
         df_merge.loc[dupm, 'Status Cruzamento'] = df_merge.loc[dupm, 'Status Cruzamento'].astype(str) + ' • duplicado na Qive'
 
     # Pendências (todas as notas já são base SAP)
@@ -911,6 +1000,13 @@ def montar_tabela_editavel(df: pd.DataFrame, df_controle: pd.DataFrame, df_nfs=N
         ]
         df_view.insert(min(5, len(df_view.columns)), 'Do que se trata', descricoes)
 
+    # prazo de manifestação, ao lado do valor (antes do merge com o controle,
+    # enquanto df_view ainda está alinhado linha a linha com df)
+    pz = prazo_manifestacao(df)
+    pos = (list(df_view.columns).index('Valor Nota Fiscal') + 1) if 'Valor Nota Fiscal' in df_view.columns else len(df_view.columns)
+    for i, c in enumerate(['Emissão', 'Dias', 'Prazo']):
+        df_view.insert(pos + i, c, pz[c].values)
+
     if not df_controle.empty and {'NF', 'CNPJ'}.issubset(df_controle.columns) and 'Nº NF' in df_view.columns:
         df_ctrl = df_controle[['NF', 'CNPJ', 'Tratado', 'Observacao_Controle']].copy()
         df_ctrl['_k'] = df_ctrl['NF'].map(norm_nf_val) + '|' + df_ctrl['CNPJ'].map(norm_cnpj_val)
@@ -928,17 +1024,23 @@ def montar_tabela_editavel(df: pd.DataFrame, df_controle: pd.DataFrame, df_nfs=N
     return df_view[[c for c in col_order if c in df_view.columns]]
 
 TODAS_SIT, TODOS_CC, TODAS_ABAS = "Todas as situações", "Todos os centros de custo", "Presença: todas"
+TODOS_PRAZOS = "Prazo: todos"
+PRAZO_OPCOES = [TODOS_PRAZOS, "Vencidas ou vencendo", "Só vencidas", f"Vencendo (até {ALERTA_PRAZO_DIAS} dias)"]
 
 def filtros(df: pd.DataFrame, key: str) -> pd.DataFrame:
+    situacoes = (sorted(df['Situação Manifestação'].dropna().unique().tolist())
+                 if 'Situação Manifestação' in df.columns else [])
+    tem_sit = len(situacoes) > 1   # em Pendências é sempre "Não Informado": filtro inútil
     tem_cc  = 'Centro de Custo' in df.columns and df['Centro de Custo'].astype(str).str.strip().ne('').any()
     tem_3   = 'Nas 3 abas' in df.columns
 
     # monta o número de colunas conforme os filtros disponíveis
-    pesos = [3, 2] + ([2] if tem_cc else []) + ([2] if tem_3 else []) + [1]
+    pesos = [3, 2] + ([2] if tem_sit else []) + ([2] if tem_cc else []) + ([2] if tem_3 else []) + [1]
     cols = st.columns(pesos)
     ci = iter(cols)
     col_busca  = next(ci)
-    col_status = next(ci)
+    col_prazo  = next(ci)
+    col_status = next(ci) if tem_sit else None
     col_cc     = next(ci) if tem_cc else None
     col_3      = next(ci) if tem_3 else None
     col_reset  = next(ci)
@@ -947,11 +1049,13 @@ def filtros(df: pd.DataFrame, key: str) -> pd.DataFrame:
         busca = st.text_input("busca", key=f"busca_{key}",
                               placeholder="Buscar por Nº NF (exato), CNPJ, emitente ou chave…",
                               label_visibility="collapsed")
-    with col_status:
-        opts = [TODAS_SIT]
-        if 'Situação Manifestação' in df.columns:
-            opts += sorted(df['Situação Manifestação'].dropna().unique().tolist())
-        sel = st.selectbox("Situação", opts, key=f"status_{key}", label_visibility="collapsed")
+    with col_prazo:
+        prazo_sel = st.selectbox("Prazo", PRAZO_OPCOES, key=f"prazo_{key}", label_visibility="collapsed")
+    sel = TODAS_SIT
+    if tem_sit:
+        with col_status:
+            sel = st.selectbox("Situação", [TODAS_SIT] + situacoes, key=f"status_{key}",
+                               label_visibility="collapsed")
 
     cc_sel = TODOS_CC
     if tem_cc:
@@ -974,7 +1078,7 @@ def filtros(df: pd.DataFrame, key: str) -> pd.DataFrame:
 
     with col_reset:
         if st.button("Limpar", key=f"reset_{key}", use_container_width=True):
-            for k in [f"busca_{key}", f"status_{key}", f"cc_{key}", f"tres_{key}"]:
+            for k in [f"busca_{key}", f"prazo_{key}", f"status_{key}", f"cc_{key}", f"tres_{key}"]:
                 st.session_state.pop(k, None)
             st.rerun()
 
@@ -997,7 +1101,21 @@ def filtros(df: pd.DataFrame, key: str) -> pd.DataFrame:
     if tres_sel != TODAS_ABAS and 'Nas 3 abas' in res.columns:
         nas3 = res['Nas 3 abas'].astype(str).str.startswith('✅')
         res = res[nas3] if tres_sel == "Só nas 3 abas" else res[~nas3]
-    return res
+
+    # prazo de manifestação + ordenação: a mais antiga (mais perto de vencer) primeiro
+    pz = prazo_manifestacao(res)
+    if prazo_sel != TODOS_PRAZOS:
+        resta = PRAZO_MANIFESTACAO_DIAS - pz['Dias']
+        if prazo_sel == "Só vencidas":
+            m = resta < 0
+        elif prazo_sel.startswith("Vencendo"):
+            m = (resta >= 0) & (resta <= ALERTA_PRAZO_DIAS)
+        else:
+            m = resta <= ALERTA_PRAZO_DIAS
+        m = m.fillna(False).astype(bool)
+        res, pz = res[m], pz[m]
+    ordem = pz['Dias'].fillna(-1).sort_values(ascending=False, kind='stable').index
+    return res.loc[ordem]
 
 def _campo_html(label: str, valor: str, mono: bool = False) -> str:
     cls = 'cb-campo-valor cb-mono' if mono else 'cb-campo-valor'
@@ -1016,6 +1134,8 @@ def painel_detalhes(registro: pd.Series, nf, cnpj, df_nfs, cols_nfs, tratado: bo
         ('CNPJ emitente', html.escape(fmt_doc(_v('CNPJ Emitente'))), True),
         ('Razão social', html.escape(_v('Razão Social')), False),
         ('Valor', html.escape(fmt_brl(_v('Valor Nota Fiscal'))), False),
+        ('Emissão', html.escape(str(prazo_manifestacao(registro.to_frame().T)['Emissão'].iloc[0])), False),
+        ('Prazo', '' if tratado else html.escape(str(prazo_manifestacao(registro.to_frame().T)['Prazo'].iloc[0])), False),
         ('Situação manifestação', html.escape(_v('Situação Manifestação')), False),
         ('Manifestação Qive', html.escape(_v('Manifestação Qive')), False),
         ('Conferência SAP × Qive', html.escape(_v('Conferência SAP×Qive')), False),
@@ -1036,6 +1156,7 @@ def painel_detalhes(registro: pd.Series, nf, cnpj, df_nfs, cols_nfs, tratado: bo
         f'<div class="cb-card-titulo">NF {html.escape(_v("Nº NF"))} · {html.escape(_v("Razão Social"))} {status}</div>'
         f'<div class="cb-grid">{itens}</div>'
         f'<div class="cb-desc">{_campo_html("Do que se trata", desc_html)}</div>'
+        f'{_historico_da_nota_html(nf, cnpj)}'
         f'</div>',
         unsafe_allow_html=True,
     )
@@ -1051,6 +1172,9 @@ def _tabela_exibicao(df_view: pd.DataFrame, key: str):
     # cada aba já separa tratados de não tratados, então a coluna só repetiria a aba
     # (e ficava parecendo uma segunda caixa de seleção ao lado da de selecionar linha)
     df_show = df_show.drop(columns=['Tratado'], errors='ignore')
+    if key == 'tratados':
+        # nota já tratada: prazo não se aplica mais (só confundiria com "Vencida")
+        df_show = df_show.drop(columns=['Dias', 'Prazo'], errors='ignore')
     if key == 'pend':
         # em Pendências a situação é sempre "Não Informado" — é o que define a pendência
         df_show = df_show.drop(columns=['Situação Manifestação'], errors='ignore')
@@ -1066,6 +1190,10 @@ def _tabela_exibicao(df_view: pd.DataFrame, key: str):
         'Na NFs': st.column_config.TextColumn("Na NFs", width="small"),
         'Chave de Acesso': st.column_config.TextColumn("Chave de acesso", width="medium"),
         'Observacao_Controle': st.column_config.TextColumn("Observação", width="medium"),
+        'Emissão': st.column_config.TextColumn("Emissão"),
+        'Dias': st.column_config.NumberColumn("Dias", width="small", format="%d",
+                                              help=f"Dias desde a emissão (prazo: {PRAZO_MANIFESTACAO_DIAS})"),
+        'Prazo': st.column_config.TextColumn("Prazo", width="medium"),
     }
     return df_show, config
 
@@ -1107,7 +1235,7 @@ def render_editavel(df_dados: pd.DataFrame, df_controle: pd.DataFrame, df_nfs, c
     # key inclui a nota: sem isso o checkbox/observação ficavam com o valor da
     # nota selecionada antes ao trocar de linha.
     k_nota = f"{key}_{nf}_{cnpj}"
-    b_exp, b_chk, b_obs, b_save = st.columns([2, 1.2, 4, 1.4])
+    b_exp, b_chk, b_obs, b_save = st.columns([2, 1.2, 4, 1.4], vertical_alignment="center")
     with b_exp:
         btn_exportar(df_filtrado, nome_export)
     with b_chk:
@@ -1157,7 +1285,7 @@ def render_editavel(df_dados: pd.DataFrame, df_controle: pd.DataFrame, df_nfs, c
 def _barra_lote(sel: pd.DataFrame, df_filtrado: pd.DataFrame, key: str, nome_export: str,
                 responsavel: str, sem_resp: bool):
     """Marca/desmarca várias notas de uma vez, num único salvamento."""
-    b_exp, b_info, b_obs, b_marca, b_desm = st.columns([2, 1.6, 3.4, 1.8, 1.4])
+    b_exp, b_info, b_obs, b_marca, b_desm = st.columns([2, 1.6, 3.4, 1.8, 1.4], vertical_alignment="center")
     with b_exp:
         btn_exportar(df_filtrado, nome_export)
     with b_info:
@@ -1264,6 +1392,94 @@ def remover_tratados(df: pd.DataFrame, df_controle: pd.DataFrame) -> pd.DataFram
     return df[~k.isin(chaves)].copy()
 
 
+def _historico_ordenado(df_hist: pd.DataFrame) -> pd.DataFrame:
+    if df_hist is None or df_hist.empty:
+        return pd.DataFrame(columns=COLS_HISTORICO)
+    quando = pd.to_datetime(df_hist['Data_Hora'], dayfirst=True, errors='coerce', format='mixed')
+    return df_hist.assign(_q=quando).sort_values('_q', ascending=False, kind='stable').drop(columns='_q')
+
+def _historico_da_nota_html(nf, cnpj) -> str:
+    h = carregar_historico()
+    if h.empty:
+        return ''
+    k = _chave_ctrl(nf, cnpj)
+    h = h[(h['NF'].map(norm_nf_val) + '|' + h['CNPJ'].map(norm_cnpj_val)) == k]
+    if h.empty:
+        return ''
+    itens = []
+    for _, r in _historico_ordenado(h).head(10).iterrows():
+        obs = f' · “{html.escape(str(r["Observacao"]))}”' if str(r['Observacao']).strip() else ''
+        itens.append(f'<div class="cb-hist-item"><span class="cb-hist-quando">{html.escape(str(r["Data_Hora"]))}</span>'
+                     f'<b>{html.escape(str(r["Responsavel"]) or "—")}</b> {html.escape(str(r["Acao"]).lower())}{obs}</div>')
+    return f'<div class="cb-desc"><div class="cb-campo-label">Histórico</div>{"".join(itens)}</div>'
+
+def render_historico():
+    h = _historico_ordenado(carregar_historico())
+    st.caption("Cada vez que alguém marca, desmarca ou muda a observação de uma nota, fica registrado aqui "
+               f"(aba **{ABA_HISTORICO}** da planilha). Mais recente primeiro.")
+    if h.empty:
+        st.info("Nenhuma alteração registrada ainda.")
+        return
+    c1, c2 = st.columns([3, 2])
+    with c1:
+        busca = st.text_input("busca_hist", key="busca_hist", label_visibility="collapsed",
+                              placeholder="Filtrar por Nº NF ou CNPJ…").strip()
+    with c2:
+        resp = st.selectbox("Responsável", ["Todos os responsáveis"] + sorted(
+            {str(x) for x in h['Responsavel'] if str(x).strip()}), key="resp_hist", label_visibility="collapsed")
+    if busca:
+        d = re.sub(r'\D', '', busca)
+        h = h[(h['NF'].map(norm_nf_val) == norm_nf_val(busca)) | (d != '' and h['CNPJ'].map(norm_cnpj_val).str.contains(d))]
+    if resp != "Todos os responsáveis":
+        h = h[h['Responsavel'] == resp]
+    show = h.assign(CNPJ=h['CNPJ'].map(fmt_doc))[['Data_Hora', 'NF', 'CNPJ', 'Acao', 'Observacao', 'Responsavel']]
+    st.dataframe(show, hide_index=True, use_container_width=True,
+                 height=min(420, 35 * (len(show) + 1) + 3),
+                 column_config={'Data_Hora': st.column_config.TextColumn("Quando", width="medium"),
+                                'NF': st.column_config.TextColumn("Nº NF", width="small"),
+                                'CNPJ': st.column_config.TextColumn("CNPJ emitente", width="medium"),
+                                'Acao': st.column_config.TextColumn("Ação", width="medium"),
+                                'Observacao': st.column_config.TextColumn("Observação", width="large"),
+                                'Responsavel': st.column_config.TextColumn("Responsável", width="small")})
+    btn_exportar(h, "historico")
+
+COLUNAS_SAP_RESUMO = ['Nº NF', 'Razão Social', 'CNPJ Emitente', 'Valor Nota Fiscal', 'Data Documento',
+                      'Situação Manifestação', 'Tipo Doc. Fiscal', 'Natureza Operação', 'CFOP',
+                      'Observação', 'Chave de Acesso']
+
+def render_tabela_sap(df: pd.DataFrame, key: str, nome_export: str, legenda: str):
+    """Fora do escopo / Excluídos: visão resumida e formatada; a completa fica a um clique."""
+    c1, c2 = st.columns([5, 2])
+    with c1:
+        st.caption(legenda)
+    with c2:
+        todas = st.toggle("Mostrar todas as colunas", key=f"todas_{key}")
+    if todas:
+        show = df
+    else:
+        # nesses DataFrames o CNPJ ainda está na coluna original do SAP
+        col_cnpj = achar_coluna(df, COL_CNPJ_SAP_CAND)
+        show = df.copy()
+        if col_cnpj and col_cnpj != 'CNPJ Emitente':
+            show['CNPJ Emitente'] = show[col_cnpj]
+        show = show[[c for c in COLUNAS_SAP_RESUMO if c in show.columns]].copy()
+        if 'CNPJ Emitente' in show.columns:
+            show['CNPJ Emitente'] = show['CNPJ Emitente'].map(fmt_doc)
+        if 'Valor Nota Fiscal' in show.columns:
+            show['Valor Nota Fiscal'] = show['Valor Nota Fiscal'].map(fmt_brl)
+        if 'Data Documento' in show.columns:
+            show['Data Documento'] = parse_data(show['Data Documento']).dt.strftime('%d/%m/%Y').fillna('')
+    st.dataframe(show, hide_index=True, use_container_width=True,
+                 height=min(420, 35 * (len(show) + 1) + 3),
+                 column_config={'Razão Social': st.column_config.TextColumn("Razão social", width="large"),
+                                'CNPJ Emitente': st.column_config.TextColumn("CNPJ emitente"),
+                                'Valor Nota Fiscal': st.column_config.TextColumn("Valor"),
+                                'Data Documento': st.column_config.TextColumn("Emissão"),
+                                'Situação Manifestação': st.column_config.TextColumn("Situação"),
+                                'Natureza Operação': st.column_config.TextColumn("Natureza da operação", width="large"),
+                                'Observação': st.column_config.TextColumn("Observação", width="large")})
+    btn_exportar(df, nome_export)
+
 def _kpi(label: str, valor: str, nota: str = '', cor: str = 'var(--border)') -> str:
     nota_html = f'<div class="cb-kpi-nota">{nota}</div>' if nota else ''
     return (f'<div class="cb-kpi" style="--kpi-cor:{cor}">'
@@ -1286,7 +1502,7 @@ def main():
     df_merge_ativo = remover_tratados(df_merge, df_controle)
 
     # ── PageHeader: título + responsável (auditoria) + recarregar ──
-    h_tit, h_resp, h_btn = st.columns([5, 3, 1.4])
+    h_tit, h_resp, h_btn = st.columns([5, 3, 1.4], vertical_alignment="bottom")
     with h_tit:
         st.markdown(
             '<div class="cb-brand">Cobli</div>'
@@ -1298,7 +1514,6 @@ def main():
         responsavel = st.text_input("Responsável pela alteração", key="responsavel",
                                     placeholder="Seu nome (obrigatório para salvar)")
     with h_btn:
-        st.markdown('<div style="height:28px"></div>', unsafe_allow_html=True)
         if st.button("Recarregar dados", use_container_width=True,
                      help="Limpa o cache e busca a planilha de novo"):
             st.cache_data.clear()
@@ -1312,9 +1527,15 @@ def main():
     valor_pend = sum(v for v in df_pend_ativo.get('Valor Nota Fiscal', pd.Series(dtype=str)).map(norm_valor)
                      if v is not None)
     pct_trat = f"{(n_trat / n_escopo * 100):.0f}%".replace('.', ',') if n_escopo else '—'
+    resta = PRAZO_MANIFESTACAO_DIAS - prazo_manifestacao(df_pend_ativo)['Dias']
+    n_venc   = int((resta < 0).fillna(False).sum())
+    n_alerta = int(((resta >= 0) & (resta <= ALERTA_PRAZO_DIAS)).fillna(False).sum())
+    nota_pend = (f"<b>{n_venc}</b> vencida(s) · <b>{n_alerta}</b> vencendo em {ALERTA_PRAZO_DIAS} dias"
+                 if (n_venc or n_alerta) else "nenhuma perto do prazo")
+    cor_pend = "var(--destructive)" if n_venc else "var(--warning)"
     st.markdown(
         '<div class="cb-kpis">'
-        + _kpi("Pendências", _fmt_int(n_pend), "notas aguardando manifestação", "var(--warning)")
+        + _kpi("Pendências", _fmt_int(n_pend), nota_pend, cor_pend)
         + _kpi("Valor pendente", fmt_brl(valor_pend) or 'R$ 0,00', "soma das pendências", "var(--warning)")
         + _kpi("Tratados", _fmt_int(n_trat), f"<b>{pct_trat}</b> do escopo", "var(--success)")
         + _kpi("Escopo analítico", _fmt_int(n_escopo), f"{_fmt_int(n_nfs)} presentes na aba NFs", "var(--primary)")
@@ -1323,13 +1544,14 @@ def main():
         unsafe_allow_html=True,
     )
 
-    t1, t2, t_trat, t3, t4, t5 = st.tabs([
+    t1, t2, t_trat, t3, t4, t5, t_hist = st.tabs([
         f"Pendências ({len(df_pend_ativo)})",
         f"Notas SAP ({len(df_merge_ativo)})",
         f"Tratados ({len(df_tratados)})",
         f"Fora do escopo ({len(df_fora)})",
         f"Excluídos ({len(df_excl)})",
         "Detalhes da NF",
+        "Histórico",
     ])
     with t1:
         render_editavel(df_pend_ativo, df_controle, df_nfs, cols_nfs, "pend", "pendencias", responsavel)
@@ -1338,15 +1560,15 @@ def main():
     with t_trat:
         render_editavel(df_tratados, df_controle, df_nfs, cols_nfs, "tratados", "tratados", responsavel)
     with t3:
-        st.caption("Notas que não são NF-e ou estão numa situação de manifestação fora da regra.")
-        st.dataframe(df_fora, hide_index=True, use_container_width=True, height=420)
-        btn_exportar(df_fora, "fora_do_escopo")
+        render_tabela_sap(df_fora, "fora", "fora_do_escopo",
+                          "Notas que não são NF-e ou estão numa situação de manifestação fora da regra.")
     with t4:
-        st.caption("No escopo, mas descartadas pela regra de negócio (devolução, retorno, comodato ou CFOP de retorno).")
-        st.dataframe(df_excl, hide_index=True, use_container_width=True, height=420)
-        btn_exportar(df_excl, "excluidos")
+        render_tabela_sap(df_excl, "excl", "excluidos",
+                          "No escopo, mas descartadas pela regra de negócio (devolução, retorno, comodato ou CFOP de retorno).")
     with t5:
         render_detalhes_nf(df_nfs, cols_nfs, aba_nfs, sheet_names, erro_nfs)
+    with t_hist:
+        render_historico()
 
 if __name__ == "__main__":
     main()
