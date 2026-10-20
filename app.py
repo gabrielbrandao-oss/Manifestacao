@@ -9,6 +9,13 @@ import gspread
 from google.oauth2.service_account import Credentials
 from google.auth.transport.requests import Request
 from datetime import datetime
+from zoneinfo import ZoneInfo
+
+# Streamlit Cloud roda em UTC; os horários de auditoria precisam sair em Brasília
+FUSO_BR = ZoneInfo("America/Sao_Paulo")
+
+def agora_br() -> datetime:
+    return datetime.now(FUSO_BR)
 
 # ═══════════════════════════════════════════════════════════
 # REGRAS DE NEGÓCIO
@@ -20,6 +27,7 @@ MAX_DOWNLOAD_MB    = 50
 TIMEOUT_S          = 120
 LIXO               = {'nan', 'none', '', 'nat', '<na>', 'null'}
 ABA_CONTROLE       = 'Controle'
+COLS_CONTROLE      = ['NF', 'CNPJ', 'Tratado', 'Observacao_Controle', 'Responsavel', 'Atualizado_em']
 
 # ── Colunas usadas (busca tolerante: ignora acento/maiúscula/apóstrofo) ──
 # Cruzamento principal: CHAVE DE ACESSO (SAP 'Chave de Acesso' x Qive 'Chave de acesso')
@@ -180,7 +188,7 @@ def btn_exportar(df: pd.DataFrame, nome: str):
     st.download_button(
         f"⬇️ Exportar {nome}",
         data=buf.getvalue(),
-        file_name=f"{nome.replace(' ','_')}_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx",
+        file_name=f"{nome.replace(' ','_')}_{agora_br().strftime('%Y%m%d_%H%M')}.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         key=f"export_{nome}",
     )
@@ -256,44 +264,90 @@ def buscar_planilha_bytes() -> bytes:
         st.error(f"Timeout/SSL: {e}")
         st.stop()
 
+def _ws_controle():
+    gc = gspread.authorize(get_credentials())
+    sh = gc.open_by_key(get_sheet_id())
+    try:
+        return sh.worksheet(ABA_CONTROLE)
+    except gspread.exceptions.WorksheetNotFound:
+        ws = sh.add_worksheet(title=ABA_CONTROLE, rows=5000, cols=len(COLS_CONTROLE))
+        ws.append_row(COLS_CONTROLE)
+        return ws
+
 @st.cache_data(show_spinner=False, ttl=30)
 def carregar_controle() -> pd.DataFrame:
-    df_vazio = pd.DataFrame(columns=['NF', 'CNPJ', 'Tratado', 'Observacao_Controle', 'Responsavel', 'Atualizado_em'])
+    df_vazio = pd.DataFrame(columns=COLS_CONTROLE)
     try:
-        gc = gspread.authorize(get_credentials())
-        sh = gc.open_by_key(get_sheet_id())
-        try:
-            ws = sh.worksheet(ABA_CONTROLE)
-            dados = ws.get_all_records()
-            df = pd.DataFrame(dados) if dados else df_vazio
-            if 'NF' not in df.columns and 'Chave' in df.columns:
-                df = df.rename(columns={'Chave': 'NF'})
-            if 'CNPJ' not in df.columns:
-                df['CNPJ'] = ''
-            return df
-        except gspread.exceptions.WorksheetNotFound:
-            ws = sh.add_worksheet(title=ABA_CONTROLE, rows=5000, cols=6)
-            ws.append_row(df_vazio.columns.tolist())
-            return df_vazio
+        ws = _ws_controle()
+        # numericise_ignore=['all']: sem isso o gspread converte '01438784001330'
+        # em número e o CNPJ perde o zero à esquerda — a nota nunca casava com o SAP.
+        dados = ws.get_all_records(numericise_ignore=['all'])
+        df = pd.DataFrame(dados) if dados else df_vazio
+        if 'NF' not in df.columns and 'Chave' in df.columns:
+            df = df.rename(columns={'Chave': 'NF'})
+        if 'CNPJ' not in df.columns:
+            df['CNPJ'] = ''
+        return df
     except Exception as e:
         st.warning(f"gspread falhou: {e}")
         return df_vazio
 
-def salvar_controle(df_controle: pd.DataFrame):
+def _chave_ctrl(nf, cnpj) -> str:
+    return norm_nf_val(nf) + '|' + norm_cnpj_val(cnpj)
+
+def salvar_controle(registros: list) -> bool:
+    """Grava na aba Controle SÓ as notas alteradas: atualiza a linha da nota se
+    ela já existe, senão acrescenta no fim. Antes a aba inteira era apagada e
+    reescrita a partir de uma cópia em cache — se a escrita falhasse no meio a
+    aba ficava vazia, e duas pessoas salvando perto uma da outra sobrescreviam
+    o trabalho uma da outra. Campos ausentes no registro mantêm o valor atual."""
     try:
-        gc = gspread.authorize(get_credentials())
-        sh = gc.open_by_key(get_sheet_id())
-        try:
-            ws = sh.worksheet(ABA_CONTROLE)
-        except gspread.exceptions.WorksheetNotFound:
-            ws = sh.add_worksheet(title=ABA_CONTROLE, rows=5000, cols=6)
-        ws.clear()
-        df_salvar = df_controle.fillna('').astype(str)
-        ws.update([df_salvar.columns.tolist()] + df_salvar.values.tolist())
+        ws = _ws_controle()
+        valores = ws.get_all_values()  # leitura fresca, sem cache
+        cab = list(valores[0]) if valores else []
+        cab_mudou = not valores
+        if 'NF' not in cab and 'Chave' in cab:
+            cab[cab.index('Chave')] = 'NF'
+            cab_mudou = True
+        faltando = [c for c in COLS_CONTROLE if c not in cab]
+        if faltando:
+            cab += faltando
+            cab_mudou = True
+        pos = {c: i for i, c in enumerate(cab)}
+
+        linha_da_chave = {}
+        for n, lin in enumerate(valores[1:], start=2):
+            lin = list(lin) + [''] * (len(cab) - len(lin))
+            linha_da_chave[_chave_ctrl(lin[pos['NF']], lin[pos['CNPJ']])] = (n, lin)
+
+        # uma entrada por nota (o último registro da mesma nota vence)
+        por_chave = {}
+        for reg in registros:
+            por_chave[_chave_ctrl(reg['NF'], reg['CNPJ'])] = reg
+
+        atualizar, novas = [], []
+        for k, reg in por_chave.items():
+            n, lin = linha_da_chave.get(k, (None, [''] * len(cab)))
+            lin = list(lin)
+            for c, v in reg.items():
+                lin[pos[c]] = '' if v is None else str(v)
+            if n:
+                atualizar.append({'range': f'A{n}', 'values': [lin]})
+            else:
+                novas.append(lin)
+
+        if cab_mudou:
+            ws.update(range_name='A1', values=[cab])
+        if atualizar:
+            ws.batch_update(atualizar)
+        if novas:
+            ws.append_rows(novas)
         carregar_controle.clear()
-        st.success("Controle salvo na planilha.")
+        st.success(f"Controle salvo na planilha ({len(por_chave)} nota(s)).")
+        return True
     except Exception as e:
         st.error(f"Falha ao salvar controle: {e}")
+        return False
 
 # ═══════════════════════════════════════════════════════════
 # PROCESSAMENTO  —  CRUZAMENTO POR CHAVE DE ACESSO
@@ -359,7 +413,9 @@ def _mapa_centro_custo(df_nfs: pd.DataFrame, df_merge: pd.DataFrame) -> pd.Serie
     return chaves.map(lambda k: idx.get(k, ''))
 
 def _nfs_index(df_nfs: pd.DataFrame):
-    """Índices da aba NFs para checar presença por CNPJ, NF, valor e nome."""
+    """Índices da aba NFs POR FORNECEDOR: {cnpj: {'nf': set, 'vals': set}} e
+    {nome_limpo: {'nf': set, 'vals': set}}. Assim NF/valor só contam se
+    estiverem na mesma linha do fornecedor."""
     try:
         if df_nfs is None or df_nfs.empty:
             return None
@@ -368,50 +424,60 @@ def _nfs_index(df_nfs: pd.DataFrame):
         col_nome = achar_coluna(df_nfs, COL_NOME_NFS_CAND)
         col_va   = achar_coluna(df_nfs, ['Total da linha'])
         col_vb   = achar_coluna(df_nfs, ['Total documento'])
-        set_nf   = set(df_nfs[col_nf].map(norm_nf_val))   if col_nf   else set()
-        set_cnpj = set(df_nfs[col_cnpj].map(norm_cnpj_val)) if col_cnpj else set()
-        nomes    = [_limpa_nome(x) for x in df_nfs[col_nome].astype(str)] if col_nome else []
-        vals = set()
-        for c in (col_va, col_vb):
-            if c:
-                vals |= {v for v in df_nfs[c].map(norm_valor) if v is not None}
-        return {'nf': set_nf, 'cnpj': set_cnpj, 'nomes': list(set(n for n in nomes if n)), 'vals': vals}
+        por_cnpj, por_nome = {}, {}
+        for _, r in df_nfs.iterrows():
+            nf   = norm_nf_val(r[col_nf]) if col_nf else ''
+            vals = {v for v in (norm_valor(r[c]) for c in (col_va, col_vb) if c) if v is not None}
+            alvos = []
+            if col_cnpj:
+                cn = norm_cnpj_val(r[col_cnpj])
+                if cn:
+                    alvos.append(por_cnpj.setdefault(cn, {'nf': set(), 'vals': set()}))
+            if col_nome:
+                nome = _limpa_nome(r[col_nome])
+                if nome:
+                    alvos.append(por_nome.setdefault(nome, {'nf': set(), 'vals': set()}))
+            for a in alvos:
+                if nf and nf.lower() not in LIXO:
+                    a['nf'].add(nf)
+                a['vals'] |= vals
+        return {'cnpj': por_cnpj, 'nome': por_nome}
     except Exception:
         return None
 
-def _nome_parecido_de_lista(nome_limpo: str, nomes_limpos: list) -> bool:
-    """Mesma regra de _nomes_parecidos, mas recebendo nomes JÁ limpos
-    (evita rechamar _limpa_nome milhares de vezes por linha)."""
-    if not nome_limpo:
+def _nomes_limpos_parecidos(na: str, nb: str) -> bool:
+    """Mesma regra de _nomes_parecidos, mas recebendo nomes JÁ limpos e sem
+    tratar nome vazio como 'parecido'."""
+    if not na or not nb:
+        return False
+    if na == nb or na in nb or nb in na:
         return True
-    sa = set(nome_limpo.split())
-    for nb in nomes_limpos:
-        if not nb:
-            continue
-        if nome_limpo == nb or nome_limpo in nb or nb in nome_limpo:
-            return True
-        sb = set(nb.split())
-        if sa and sb and len(sa & sb) / min(len(sa), len(sb)) >= 0.6:
-            return True
-    return False
+    sa, sb = set(na.split()), set(nb.split())
+    return bool(sa and sb and len(sa & sb) / min(len(sa), len(sb)) >= 0.6)
 
 def _presenca_nfs(df_nfs: pd.DataFrame, df_merge: pd.DataFrame) -> pd.Series:
-    """Marca True quando a nota também aparece na aba NFs, batendo pelos campos
-    disponíveis (CNPJ, Nº NF, valor e nome do fornecedor)."""
+    """Marca True quando a nota aparece na aba NFs: o fornecedor (CNPJ; se não
+    achar, nome parecido) precisa ter, NAS SUAS PRÓPRIAS LINHAS, o mesmo Nº NF
+    ou o mesmo valor. Antes bastava o fornecedor existir em qualquer linha e o
+    número existir em qualquer outra — NFs como 4, 7 ou 8 sempre 'batiam'."""
     idx = _nfs_index(df_nfs)
     if not idx:
         return pd.Series(False, index=df_merge.index)
+
+    def _bate(grupo, nf, val):
+        return (nf and nf in grupo['nf']) or (val is not None and val in grupo['vals'])
+
     res = []
-    nomes_nfs = idx['nomes']
     for _, r in df_merge.iterrows():
         nf   = norm_nf_val(r.get('Nº NF', ''))
         cn   = norm_cnpj_val(r.get('CNPJ Emitente', ''))
         val  = norm_valor(r.get('Valor Nota Fiscal', ''))
-        nome = _limpa_nome(r.get('Razão Social', ''))
-        # precisa identificar o fornecedor (CNPJ ou nome) E confirmar por NF ou valor
-        forn_ok = (cn and cn in idx['cnpj']) or _nome_parecido_de_lista(nome, nomes_nfs)
-        doc_ok  = (nf and nf in idx['nf']) or (val is not None and val in idx['vals'])
-        res.append(bool(forn_ok and doc_ok))
+        ok = bool(cn and cn in idx['cnpj'] and _bate(idx['cnpj'][cn], nf, val))
+        if not ok:
+            nome = _limpa_nome(r.get('Razão Social', ''))
+            ok = any(_nomes_limpos_parecidos(nome, nb) and _bate(g, nf, val)
+                     for nb, g in idx['nome'].items())
+        res.append(ok)
     return pd.Series(res, index=df_merge.index)
 
 @st.cache_data(show_spinner=False)
@@ -481,6 +547,16 @@ def processar(file_bytes: bytes):
         mask_excl |= cfop_norm.isin(CFOP_RETORNO_DEVOLUCAO)
     df_excluidos = df_no_escopo[mask_excl].copy()
     df_ativo     = df_no_escopo[~mask_excl].copy()
+
+    # SAP às vezes traz a mesma nota em mais de uma linha (mesma chave de
+    # acesso); sem isso ela vira duas pendências. Feito depois da regra de
+    # exclusão para não perder um CFOP/natureza que só aparece numa das linhas.
+    def _sem_chave_repetida(df):
+        tem = df['_chave'].str.len() > 0
+        return df[~(tem & df['_chave'].duplicated(keep='first'))].copy()
+    df_ativo       = _sem_chave_repetida(df_ativo)
+    df_excluidos   = _sem_chave_repetida(df_excluidos)
+    df_fora_escopo = _sem_chave_repetida(df_fora_escopo)
 
     # Qive: marca duplicatas de chave e dedup (mantém 1)
     df_qive_u = df_qive.copy()
@@ -771,7 +847,7 @@ def filtros(df: pd.DataFrame, key: str) -> pd.DataFrame:
 
     with col_busca:
         busca = st.text_input("busca", key=f"busca_{key}",
-                              placeholder="Buscar por Nº NF, CNPJ, emitente ou chave…",
+                              placeholder="Buscar por Nº NF (exato), CNPJ, emitente ou chave…",
                               label_visibility="collapsed")
     with col_status:
         opts = ["Todos"]
@@ -805,11 +881,16 @@ def filtros(df: pd.DataFrame, key: str) -> pd.DataFrame:
             st.rerun()
 
     res = df.copy()
-    if busca:
+    busca = busca.strip()
+    if busca and re.fullmatch(r'\d{1,9}', busca) and 'Nº NF' in res.columns:
+        # só dígitos e até 9 (tamanho máximo de um nº de NF): busca a NF exata,
+        # senão '3459' também trazia notas com 3459 no meio do CNPJ ou da chave
+        res = res[res['Nº NF'].map(norm_nf_val).str.lstrip('0') == busca.lstrip('0')]
+    elif busca:
         mask = pd.Series(False, index=res.index)
         for col in ['Nº NF', 'CNPJ Emitente', 'Chave de Acesso', 'Razão Social']:
             if col in res.columns:
-                mask |= res[col].astype(str).str.contains(busca, case=False, na=False)
+                mask |= res[col].astype(str).str.contains(busca, case=False, na=False, regex=False)
         res = res[mask]
     if sel != "Todos" and 'Situação Manifestação' in res.columns:
         res = res[res['Situação Manifestação'] == sel]
@@ -858,39 +939,52 @@ def render_editavel(df_dados: pd.DataFrame, df_controle: pd.DataFrame, df_nfs, c
             'Observacao_Controle': st.column_config.TextColumn("📝 Observação"),
         },
         hide_index=True, use_container_width=True,
-        on_select="rerun", selection_mode="single-row",
+        on_select="rerun", selection_mode="multi-row",
         key=f"sel_{key}",
     )
 
-    # Linha selecionada
+    # Linhas selecionadas (1 = controle + detalhes da nota; 2+ = ação em lote)
     try:
         rows = event.selection["rows"]
     except Exception:
         rows = getattr(getattr(event, "selection", None), "rows", []) or []
-    sel_idx = rows[0] if rows and rows[0] < len(df_view) else None
-    linha = df_view.iloc[sel_idx] if sel_idx is not None else None
+    rows = [r for r in rows if r < len(df_view)]
+    sem_resp = not str(responsavel or '').strip()
+
+    if len(rows) > 1:
+        _barra_lote(df_view.iloc[rows], df_filtrado, key, nome_export, responsavel, sem_resp)
+        return
+
+    linha = df_view.iloc[rows[0]] if rows else None
     nf    = norm_nf_val(linha.get('Nº NF', '')) if linha is not None else ''
     cnpj  = norm_cnpj_val(linha.get('CNPJ Emitente', '')) if linha is not None else ''
 
     # ── BARRA SUPERIOR: Exportar + Controle desta nota (lado a lado) ──
+    # key inclui a nota: sem isso o checkbox/observação ficavam com o valor da
+    # nota selecionada antes ao trocar de linha.
+    k_nota = f"{key}_{nf}_{cnpj}"
     b_exp, b_chk, b_obs, b_save = st.columns([2, 1, 3, 1])
     with b_exp:
         btn_exportar(df_filtrado, nome_export)
     with b_chk:
         novo_tratado = st.checkbox("✅ Tratado",
                                    value=bool(linha.get('Tratado', False)) if linha is not None else False,
-                                   key=f"chk_{key}", disabled=(linha is None))
+                                   key=f"chk_{k_nota}", disabled=(linha is None))
     with b_obs:
         nova_obs = st.text_input("📝 Observação",
                                  value=str(linha.get('Observacao_Controle', '') or '') if linha is not None else '',
-                                 key=f"obs_{key}", disabled=(linha is None),
+                                 key=f"obs_{k_nota}", disabled=(linha is None),
                                  label_visibility="collapsed", placeholder="Observação desta nota…")
     with b_save:
-        salvar_click = st.button("💾 Salvar", type="primary", key=f"savrow_{key}", disabled=(linha is None))
+        salvar_click = st.button("💾 Salvar", type="primary", key=f"savrow_{key}",
+                                 disabled=(linha is None or sem_resp))
 
     if linha is None:
-        st.info("👆 Selecione uma linha acima para ver os detalhes e habilitar o controle.")
+        st.info("👆 Selecione uma linha acima para ver os detalhes e habilitar o controle "
+                "(selecione várias para marcar em lote).")
         return
+    if sem_resp:
+        st.warning("👤 Preencha o **Responsável pela alteração** na barra lateral para poder salvar.")
 
     # Registro completo (todas as colunas) para o painel
     registro = linha
@@ -905,29 +999,59 @@ def render_editavel(df_dados: pd.DataFrame, df_controle: pd.DataFrame, df_nfs, c
 
     # Salvar (ação do botão da barra superior)
     if salvar_click:
-        if not responsavel:
-            st.error("Preencha o responsável na barra lateral.")
-            st.stop()
         if not nf:
             st.error("Esta linha não tem Nº NF.")
             st.stop()
-        agora = datetime.now().strftime("%d/%m/%Y %H:%M")
-        nova_linha = pd.DataFrame([{
+        ok = salvar_controle([{
             'NF': nf, 'CNPJ': cnpj, 'Tratado': novo_tratado,
-            'Observacao_Controle': nova_obs, 'Responsavel': responsavel, 'Atualizado_em': agora,
+            'Observacao_Controle': nova_obs, 'Responsavel': responsavel.strip(),
+            'Atualizado_em': agora_br().strftime("%d/%m/%Y %H:%M"),
         }])
-        if df_controle is not None and not df_controle.empty and {'NF', 'CNPJ'}.issubset(df_controle.columns):
-            k_atual = nf + '|' + cnpj
-            kctrl = df_controle['NF'].map(norm_nf_val) + '|' + df_controle['CNPJ'].map(norm_cnpj_val)
-            restante = df_controle[kctrl != k_atual]
-        else:
-            restante = pd.DataFrame(columns=['NF', 'CNPJ', 'Tratado', 'Observacao_Controle', 'Responsavel', 'Atualizado_em'])
-        novo_ctrl = pd.concat([restante, nova_linha], ignore_index=True)
-        salvar_controle(novo_ctrl)
-        st.rerun()
+        if ok:
+            st.rerun()
 
     st.divider()
     painel_detalhes(registro, nf, cnpj, df_nfs, cols_nfs)
+
+def _barra_lote(sel: pd.DataFrame, df_filtrado: pd.DataFrame, key: str, nome_export: str,
+                responsavel: str, sem_resp: bool):
+    """Marca/desmarca várias notas de uma vez, num único salvamento."""
+    b_exp, b_info, b_obs, b_marca, b_desm = st.columns([2, 2, 3, 2, 2])
+    with b_exp:
+        btn_exportar(df_filtrado, nome_export)
+    with b_info:
+        st.markdown(f"**{len(sel)} notas selecionadas**")
+    with b_obs:
+        obs = st.text_input("📝 Observação", key=f"obslote_{key}", label_visibility="collapsed",
+                            placeholder="Observação p/ todas (vazio mantém a atual)…")
+    with b_marca:
+        marcar = st.button("✅ Marcar tratadas", type="primary", key=f"lote_ok_{key}",
+                           disabled=sem_resp, use_container_width=True)
+    with b_desm:
+        desmarcar = st.button("↩️ Desmarcar", key=f"lote_undo_{key}",
+                              disabled=sem_resp, use_container_width=True)
+    if sem_resp:
+        st.warning("👤 Preencha o **Responsável pela alteração** na barra lateral para poder salvar.")
+    if not (marcar or desmarcar):
+        return
+
+    agora = agora_br().strftime("%d/%m/%Y %H:%M")
+    registros = []
+    for _, linha in sel.iterrows():
+        nf = norm_nf_val(linha.get('Nº NF', ''))
+        if not nf or nf.lower() in LIXO:
+            continue
+        reg = {'NF': nf, 'CNPJ': norm_cnpj_val(linha.get('CNPJ Emitente', '')),
+               'Tratado': bool(marcar), 'Responsavel': responsavel.strip(), 'Atualizado_em': agora}
+        if obs.strip():
+            reg['Observacao_Controle'] = obs.strip()
+        registros.append(reg)
+    if not registros:
+        st.error("Nenhuma das linhas selecionadas tem Nº NF.")
+        return
+    if salvar_controle(registros):
+        st.session_state.pop(f"sel_{key}", None)  # limpa a seleção depois de salvar
+        st.rerun()
 
 def render_detalhes_nf(df_nfs, cols_nfs, aba_real, sheet_names, erro):
     col_nf   = cols_nfs.get('col_nf')
@@ -1015,7 +1139,7 @@ def main():
         df_merge, df_pend, df_fora, df_excl = processar(raw)
         df_nfs, cols_nfs, aba_nfs, sheet_names, erro_nfs = carregar_nfs(raw)
         df_controle = carregar_controle()
-        st.session_state['atualizado_em'] = datetime.now().strftime("%d/%m/%Y %H:%M")
+        st.session_state['atualizado_em'] = agora_br().strftime("%d/%m/%Y %H:%M")
 
     df_tratados = filtrar_tratados(df_merge, df_controle)
     df_pend_ativo = remover_tratados(df_pend, df_controle)
