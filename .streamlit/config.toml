@@ -1,0 +1,8 @@
+# Design System Cobli — modo Light (tokens --primary, --background, --muted, --foreground)
+[theme]
+base = "light"
+primaryColor = "#001BB8"
+backgroundColor = "#FFFFFF"
+secondaryBackgroundColor = "#F4F4F5"
+textColor = "#020231"
+font = "sans serif"

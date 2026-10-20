@@ -5,6 +5,7 @@ import numpy as np
 import io
 import requests
 import re
+import html
 import gspread
 from google.oauth2.service_account import Credentials
 from google.auth.transport.requests import Request
@@ -80,8 +81,87 @@ COLUNAS_EXIBIR = [
     'Chave de Acesso',
 ]
 
-st.set_page_config(page_title="Manifestações NF-e", layout="wide")
-st.title("📋 Gestão de Manifestações NF-e")
+st.set_page_config(page_title="Manifestações NF-e", layout="wide", initial_sidebar_state="collapsed")
+
+# ═══════════════════════════════════════════════════════════
+# IDENTIDADE VISUAL — Design System Cobli (estilo Vega, modo Light)
+# Cores base também em .streamlit/config.toml (tabela e widgets nativos).
+# ═══════════════════════════════════════════════════════════
+COBLI_CSS = """
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600&family=Geist+Mono:wght@400;500&display=swap');
+:root {
+  --background:#FFFFFF; --foreground:#020231; --card:#FFFFFF; --primary:#001BB8;
+  --primary-foreground:#FAFAFA; --secondary:#DCEBFE; --secondary-foreground:#07074F;
+  --accent:#F4F4F5; --muted:#F4F4F5; --muted-foreground:#71717A; --border:#E4E4E7;
+  --ring:#A1A1AA; --destructive:#DC2626; --success:#0D9488; --warning:#EA580C;
+  --highlight:#00C2A8; --outline:#001BB880;
+}
+html, body, .stApp, .stMarkdown, p, label, input, textarea, button, h1, h2, h3, h4,
+[data-baseweb="tab"], [data-baseweb="select"], [data-testid="stCaptionContainer"] {
+  font-family:'Geist', system-ui, sans-serif !important;
+}
+.stApp { background:var(--background); color:var(--foreground); }
+[data-testid="stHeader"] { background:transparent; }
+.block-container, [data-testid="stAppViewBlockContainer"] { padding-top:2.2rem; padding-bottom:3rem; max-width:1440px; }
+
+/* PageHeader */
+.cb-header { display:flex; align-items:flex-end; justify-content:space-between; gap:16px; }
+.cb-brand { font-size:12px; font-weight:600; letter-spacing:.08em; text-transform:uppercase; color:var(--primary); margin-bottom:4px; }
+.cb-title { font-size:24px; line-height:32px; font-weight:600; color:var(--foreground); margin:0; }
+.cb-sub { font-size:14px; color:var(--muted-foreground); margin-top:4px; }
+
+/* KPI Cards */
+.cb-kpis { display:grid; grid-template-columns:repeat(5, minmax(0,1fr)); gap:12px; margin:20px 0 8px; }
+@media (max-width:1024px){ .cb-kpis { grid-template-columns:repeat(2, minmax(0,1fr)); } }
+.cb-kpi { background:var(--card); border:1px solid var(--border); border-radius:14px; padding:18px 20px;
+          box-shadow:0 1px 2px rgba(2,2,49,.05); position:relative; overflow:hidden; }
+.cb-kpi::before { content:""; position:absolute; left:0; top:0; bottom:0; width:3px; background:var(--kpi-cor, var(--border)); }
+.cb-kpi-label { font-size:12px; font-weight:500; letter-spacing:.04em; text-transform:uppercase; color:var(--muted-foreground);
+                white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+.cb-kpi-valor { font-size:28px; line-height:36px; font-weight:600; color:var(--foreground); margin-top:6px;
+                font-variant-numeric:tabular-nums; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+.cb-kpi-nota { font-size:12px; color:var(--muted-foreground); margin-top:2px; }
+.cb-kpi-nota b { color:var(--kpi-cor, var(--foreground)); font-weight:600; }
+
+/* Tabs (Vega) */
+[data-baseweb="tab-list"] { background:var(--muted); border-radius:10px; padding:4px; gap:4px; width:fit-content; max-width:100%; overflow-x:auto; }
+[data-baseweb="tab"] { border-radius:8px !important; padding:6px 12px !important; height:auto !important; background:transparent; }
+[data-baseweb="tab"] p { font-size:14px !important; font-weight:500; color:var(--muted-foreground); }
+[data-baseweb="tab"][aria-selected="true"] { background:var(--background); box-shadow:0 1px 2px rgba(2,2,49,.08); }
+[data-baseweb="tab"][aria-selected="true"] p { color:var(--foreground); }
+[data-baseweb="tab-highlight"], [data-baseweb="tab-border"] { display:none; }
+[data-testid="stTabs"] [data-baseweb="tab-panel"] { padding-top:16px; }
+
+/* Buttons / Inputs (Vega: radius 8, altura 36) */
+.stButton > button, .stDownloadButton > button { border-radius:8px; min-height:36px; padding:6px 16px; font-weight:500;
+  font-size:14px; white-space:nowrap; border:1px solid var(--border); }
+.stButton > button[kind="primary"] { background:var(--primary); border-color:var(--primary); color:var(--primary-foreground); }
+.stButton > button[kind="primary"]:hover { background:#0248E9; border-color:#0248E9; }
+.stButton > button:disabled, .stButton > button[kind="primary"]:disabled { background:var(--muted); border-color:var(--border); color:var(--ring); }
+.stButton > button:focus-visible, .stDownloadButton > button:focus-visible { box-shadow:0 0 0 3px var(--outline); }
+[data-baseweb="input"], [data-baseweb="select"] > div { border-radius:8px !important; border-color:var(--border) !important; }
+[data-testid="stCheckbox"] label p { white-space:nowrap; }
+[data-testid="stHorizontalBlock"] { align-items:center; }
+
+/* Tabela */
+[data-testid="stDataFrame"] { border:1px solid var(--border); border-radius:10px; overflow:hidden; }
+
+/* Painel de detalhes */
+.cb-card { background:var(--card); border:1px solid var(--border); border-radius:14px; padding:20px 24px; margin-top:8px; }
+.cb-card-titulo { font-size:16px; font-weight:600; color:var(--foreground); margin-bottom:14px; display:flex; gap:8px; align-items:center; }
+.cb-grid { display:grid; grid-template-columns:repeat(auto-fill, minmax(200px,1fr)); gap:14px 24px; }
+.cb-campo-label { font-size:12px; font-weight:500; color:var(--muted-foreground); text-transform:uppercase; letter-spacing:.04em; }
+.cb-campo-valor { font-size:14px; color:var(--foreground); margin-top:2px; word-break:break-word; }
+.cb-mono { font-family:'Geist Mono', ui-monospace, monospace !important; font-size:13px; }
+.cb-desc { margin-top:16px; padding-top:14px; border-top:1px solid var(--border); }
+.cb-badge { display:inline-block; border-radius:8px; padding:2px 10px; font-size:12px; font-weight:500; }
+.cb-badge-ok { background:#F0FDFA; color:var(--success); }
+.cb-badge-pend { background:#FFF7ED; color:var(--warning); }
+.cb-badge-neutro { background:var(--muted); color:var(--muted-foreground); }
+</style>
+"""
+st.markdown(COBLI_CSS, unsafe_allow_html=True)
 
 # ═══════════════════════════════════════════════════════════
 # UTILITÁRIOS
@@ -113,6 +193,22 @@ def norm_valor(v):
         return round(float(t), 2)
     except ValueError:
         return None
+
+def fmt_brl(v) -> str:
+    """22670.4 -> 'R$ 22.670,40' (vazio se não for número)."""
+    x = v if isinstance(v, (int, float)) and not pd.isna(v) else norm_valor(v)
+    if x is None:
+        return ''
+    return 'R$ ' + f"{x:,.2f}".replace(',', '_').replace('.', ',').replace('_', '.')
+
+def fmt_doc(v) -> str:
+    """CNPJ/CPF só com dígitos -> com máscara. Outros formatos voltam como vieram."""
+    d = norm_cnpj_val(v)
+    if len(d) == 14:
+        return f"{d[:2]}.{d[2:5]}.{d[5:8]}/{d[8:12]}-{d[12:]}"
+    if len(d) == 11:
+        return f"{d[:3]}.{d[3:6]}.{d[6:9]}-{d[9:]}"
+    return str(v)
 
 def norm_chave(s: pd.Series) -> pd.Series:
     return s.astype(str).str.replace(r'\D', '', regex=True).str.strip()
@@ -186,7 +282,7 @@ def btn_exportar(df: pd.DataFrame, nome: str):
     with pd.ExcelWriter(buf, engine='openpyxl') as w:
         df.to_excel(w, index=False)
     st.download_button(
-        f"⬇️ Exportar {nome}",
+        f"Exportar {nome.replace('_', ' ')}",
         data=buf.getvalue(),
         file_name=f"{nome.replace(' ','_')}_{agora_br().strftime('%Y%m%d_%H%M')}.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
@@ -813,7 +909,7 @@ def montar_tabela_editavel(df: pd.DataFrame, df_controle: pd.DataFrame, df_nfs=N
             )
             for i, nf_n, cn_n in zip(df.index, nf_col, cn_col)
         ]
-        df_view.insert(min(5, len(df_view.columns)), '📖 Do que se trata', descricoes)
+        df_view.insert(min(5, len(df_view.columns)), 'Do que se trata', descricoes)
 
     if not df_controle.empty and {'NF', 'CNPJ'}.issubset(df_controle.columns) and 'Nº NF' in df_view.columns:
         df_ctrl = df_controle[['NF', 'CNPJ', 'Tratado', 'Observacao_Controle']].copy()
@@ -830,6 +926,8 @@ def montar_tabela_editavel(df: pd.DataFrame, df_controle: pd.DataFrame, df_nfs=N
 
     col_order = ['Tratado'] + [c for c in df_view.columns if c not in ('Tratado', 'Observacao_Controle')] + ['Observacao_Controle']
     return df_view[[c for c in col_order if c in df_view.columns]]
+
+TODAS_SIT, TODOS_CC, TODAS_ABAS = "Todas as situações", "Todos os centros de custo", "Presença: todas"
 
 def filtros(df: pd.DataFrame, key: str) -> pd.DataFrame:
     tem_cc  = 'Centro de Custo' in df.columns and df['Centro de Custo'].astype(str).str.strip().ne('').any()
@@ -850,12 +948,12 @@ def filtros(df: pd.DataFrame, key: str) -> pd.DataFrame:
                               placeholder="Buscar por Nº NF (exato), CNPJ, emitente ou chave…",
                               label_visibility="collapsed")
     with col_status:
-        opts = ["Todos"]
+        opts = [TODAS_SIT]
         if 'Situação Manifestação' in df.columns:
             opts += sorted(df['Situação Manifestação'].dropna().unique().tolist())
-        sel = st.selectbox("status", opts, key=f"status_{key}", label_visibility="collapsed")
+        sel = st.selectbox("Situação", opts, key=f"status_{key}", label_visibility="collapsed")
 
-    cc_sel = "Todos"
+    cc_sel = TODOS_CC
     if tem_cc:
         todos_cc = set()
         for v in df['Centro de Custo'].dropna().astype(str):
@@ -864,18 +962,18 @@ def filtros(df: pd.DataFrame, key: str) -> pd.DataFrame:
                 if p:
                     todos_cc.add(p)
         with col_cc:
-            cc_sel = st.selectbox("centro de custo", ["Todos"] + sorted(todos_cc),
+            cc_sel = st.selectbox("Centro de custo", [TODOS_CC] + sorted(todos_cc),
                                   key=f"cc_{key}", label_visibility="collapsed")
 
-    tres_sel = "Todos"
+    tres_sel = TODAS_ABAS
     if tem_3:
         with col_3:
-            tres_sel = st.selectbox("nas 3 abas",
-                                    ["Todos", "Só nas 3 abas", "Falta em alguma"],
+            tres_sel = st.selectbox("Presença nas abas",
+                                    [TODAS_ABAS, "Só nas 3 abas", "Falta em alguma"],
                                     key=f"tres_{key}", label_visibility="collapsed")
 
     with col_reset:
-        if st.button("↺", key=f"reset_{key}"):
+        if st.button("Limpar", key=f"reset_{key}", use_container_width=True):
             for k in [f"busca_{key}", f"status_{key}", f"cc_{key}", f"tres_{key}"]:
                 st.session_state.pop(k, None)
             st.rerun()
@@ -892,53 +990,99 @@ def filtros(df: pd.DataFrame, key: str) -> pd.DataFrame:
             if col in res.columns:
                 mask |= res[col].astype(str).str.contains(busca, case=False, na=False, regex=False)
         res = res[mask]
-    if sel != "Todos" and 'Situação Manifestação' in res.columns:
+    if sel != TODAS_SIT and 'Situação Manifestação' in res.columns:
         res = res[res['Situação Manifestação'] == sel]
-    if cc_sel != "Todos" and 'Centro de Custo' in res.columns:
+    if cc_sel != TODOS_CC and 'Centro de Custo' in res.columns:
         res = res[res['Centro de Custo'].astype(str).str.contains(rf'(^|\|)\s*{re.escape(cc_sel)}\s*($|\|)', regex=True)]
-    if tres_sel != "Todos" and 'Nas 3 abas' in res.columns:
+    if tres_sel != TODAS_ABAS and 'Nas 3 abas' in res.columns:
         nas3 = res['Nas 3 abas'].astype(str).str.startswith('✅')
         res = res[nas3] if tres_sel == "Só nas 3 abas" else res[~nas3]
     return res
 
-def painel_detalhes(registro: pd.Series, nf, cnpj, df_nfs, cols_nfs):
-    st.markdown("#### 📑 Dados da nota selecionada")
-    campos = ['Nº NF', 'CNPJ Emitente', 'Razão Social', 'Valor Nota Fiscal',
-              'Situação Manifestação']
-    kv = []
-    for c in campos:
-        if c in registro.index:
-            val = str(registro[c]).strip()
-            if val and val.lower() not in LIXO:
-                kv.append({'Campo': c, 'Valor': val})
+def _campo_html(label: str, valor: str, mono: bool = False) -> str:
+    cls = 'cb-campo-valor cb-mono' if mono else 'cb-campo-valor'
+    return (f'<div><div class="cb-campo-label">{html.escape(label)}</div>'
+            f'<div class="{cls}">{valor}</div></div>')
 
-    # "Do que se trata" — Descrição do item/serviço (coluna E da aba NF's) —
-    # entra como mais uma linha da MESMA tabela, junto com os dados da nota.
-    nome_nota  = str(registro.get('Razão Social', ''))
-    valor_nota = registro.get('Valor Nota Fiscal', '')
-    desc = descricao_da_nf(df_nfs, cols_nfs, nf, cnpj, nome_nota, valor_nota)
-    kv.append({
-        'Campo': '📖 Do que se trata',
-        'Valor': desc if desc else "Não encontrada na aba NF's."
-    })
+def painel_detalhes(registro: pd.Series, nf, cnpj, df_nfs, cols_nfs, tratado: bool = False):
+    def _v(c):
+        val = str(registro.get(c, '')).strip()
+        return '' if val.lower() in LIXO else val
 
-    if kv:
-        st.dataframe(pd.DataFrame(kv), hide_index=True, use_container_width=True)
+    status = ('<span class="cb-badge cb-badge-ok">Tratado</span>' if tratado
+              else '<span class="cb-badge cb-badge-pend">Pendente</span>')
+    campos = [
+        ('Nº NF', html.escape(_v('Nº NF')), True),
+        ('CNPJ emitente', html.escape(fmt_doc(_v('CNPJ Emitente'))), True),
+        ('Razão social', html.escape(_v('Razão Social')), False),
+        ('Valor', html.escape(fmt_brl(_v('Valor Nota Fiscal'))), False),
+        ('Situação manifestação', html.escape(_v('Situação Manifestação')), False),
+        ('Manifestação Qive', html.escape(_v('Manifestação Qive')), False),
+        ('Conferência SAP × Qive', html.escape(_v('Conferência SAP×Qive')), False),
+        ('Centro de custo', html.escape(_v('Centro de Custo')), False),
+        ('Presente na aba NFs', html.escape(_v('Na NFs')), False),
+    ]
+    itens = ''.join(_campo_html(l, v, m) for l, v, m in campos if v)
+    chave = _v('Chave de Acesso')
+    if chave:
+        itens += _campo_html('Chave de acesso', html.escape(chave), mono=True)
+
+    # "Do que se trata" — Descrição do item/serviço (coluna E da aba NF's)
+    desc = descricao_da_nf(df_nfs, cols_nfs, nf, cnpj, _v('Razão Social'), _v('Valor Nota Fiscal'))
+    desc_html = html.escape(desc).replace(' | ', '<br>') if desc else "Não encontrada na aba NF's."
+
+    st.markdown(
+        f'<div class="cb-card">'
+        f'<div class="cb-card-titulo">NF {html.escape(_v("Nº NF"))} · {html.escape(_v("Razão Social"))} {status}</div>'
+        f'<div class="cb-grid">{itens}</div>'
+        f'<div class="cb-desc">{_campo_html("Do que se trata", desc_html)}</div>'
+        f'</div>',
+        unsafe_allow_html=True,
+    )
+
+def _tabela_exibicao(df_view: pd.DataFrame, key: str):
+    """Cópia só para mostrar: R$, CNPJ com máscara e sem colunas redundantes.
+    A lógica (salvar, lote, detalhes) continua usando o df_view original."""
+    df_show = df_view.copy()
+    if 'Valor Nota Fiscal' in df_show.columns:
+        df_show['Valor Nota Fiscal'] = df_show['Valor Nota Fiscal'].map(fmt_brl)
+    if 'CNPJ Emitente' in df_show.columns:
+        df_show['CNPJ Emitente'] = df_show['CNPJ Emitente'].map(fmt_doc)
+    # cada aba já separa tratados de não tratados, então a coluna só repetiria a aba
+    # (e ficava parecendo uma segunda caixa de seleção ao lado da de selecionar linha)
+    df_show = df_show.drop(columns=['Tratado'], errors='ignore')
+    if key == 'pend':
+        # em Pendências a situação é sempre "Não Informado" — é o que define a pendência
+        df_show = df_show.drop(columns=['Situação Manifestação'], errors='ignore')
+    config = {
+        'Tratado': st.column_config.CheckboxColumn("Tratado", width="small"),
+        'Nº NF': st.column_config.TextColumn("Nº NF", width="small"),
+        'CNPJ Emitente': st.column_config.TextColumn("CNPJ emitente", width="medium"),
+        'Razão Social': st.column_config.TextColumn("Razão social", width="large"),
+        'Valor Nota Fiscal': st.column_config.TextColumn("Valor", width="medium"),
+        'Situação Manifestação': st.column_config.TextColumn("Situação", width="small"),
+        'Do que se trata': st.column_config.TextColumn("Do que se trata", width="large"),
+        'Centro de Custo': st.column_config.TextColumn("Centro de custo", width="medium"),
+        'Na NFs': st.column_config.TextColumn("Na NFs", width="small"),
+        'Chave de Acesso': st.column_config.TextColumn("Chave de acesso", width="medium"),
+        'Observacao_Controle': st.column_config.TextColumn("Observação", width="medium"),
+    }
+    return df_show, config
 
 def render_editavel(df_dados: pd.DataFrame, df_controle: pd.DataFrame, df_nfs, cols_nfs,
                     key: str, nome_export: str, responsavel: str):
     df_filtrado = filtros(df_dados, key).reset_index(drop=True)
-    st.caption(f"{len(df_filtrado)} registro(s) — clique numa linha para abrir os detalhes abaixo")
+    st.caption(f"{len(df_filtrado)} registro(s) · clique numa linha para ver os detalhes, "
+               "ou selecione várias para marcar em lote")
 
     df_view = montar_tabela_editavel(df_filtrado, df_controle, df_nfs, cols_nfs).reset_index(drop=True)
+    df_show, col_config = _tabela_exibicao(df_view, key)
 
     event = st.dataframe(
-        df_view,
-        column_config={
-            'Tratado': st.column_config.CheckboxColumn("✅ Tratado"),
-            'Observacao_Controle': st.column_config.TextColumn("📝 Observação"),
-        },
+        df_show,
+        column_config=col_config,
         hide_index=True, use_container_width=True,
+        height=min(420, 35 * (len(df_show) + 1) + 3),
         on_select="rerun", selection_mode="multi-row",
         key=f"sel_{key}",
     )
@@ -963,28 +1107,26 @@ def render_editavel(df_dados: pd.DataFrame, df_controle: pd.DataFrame, df_nfs, c
     # key inclui a nota: sem isso o checkbox/observação ficavam com o valor da
     # nota selecionada antes ao trocar de linha.
     k_nota = f"{key}_{nf}_{cnpj}"
-    b_exp, b_chk, b_obs, b_save = st.columns([2, 1, 3, 1])
+    b_exp, b_chk, b_obs, b_save = st.columns([2, 1.2, 4, 1.4])
     with b_exp:
         btn_exportar(df_filtrado, nome_export)
     with b_chk:
-        novo_tratado = st.checkbox("✅ Tratado",
+        novo_tratado = st.checkbox("Tratado",
                                    value=bool(linha.get('Tratado', False)) if linha is not None else False,
                                    key=f"chk_{k_nota}", disabled=(linha is None))
     with b_obs:
-        nova_obs = st.text_input("📝 Observação",
+        nova_obs = st.text_input("Observação",
                                  value=str(linha.get('Observacao_Controle', '') or '') if linha is not None else '',
                                  key=f"obs_{k_nota}", disabled=(linha is None),
                                  label_visibility="collapsed", placeholder="Observação desta nota…")
     with b_save:
-        salvar_click = st.button("💾 Salvar", type="primary", key=f"savrow_{key}",
-                                 disabled=(linha is None or sem_resp))
+        salvar_click = st.button("Salvar", type="primary", key=f"savrow_{key}",
+                                 disabled=(linha is None or sem_resp), use_container_width=True)
 
     if linha is None:
-        st.info("👆 Selecione uma linha acima para ver os detalhes e habilitar o controle "
-                "(selecione várias para marcar em lote).")
         return
     if sem_resp:
-        st.warning("👤 Preencha o **Responsável pela alteração** na barra lateral para poder salvar.")
+        st.warning("Preencha o **Responsável pela alteração** no topo da página para poder salvar.")
 
     # Registro completo (todas as colunas) para o painel
     registro = linha
@@ -1010,28 +1152,27 @@ def render_editavel(df_dados: pd.DataFrame, df_controle: pd.DataFrame, df_nfs, c
         if ok:
             st.rerun()
 
-    st.divider()
-    painel_detalhes(registro, nf, cnpj, df_nfs, cols_nfs)
+    painel_detalhes(registro, nf, cnpj, df_nfs, cols_nfs, tratado=bool(linha.get('Tratado', False)))
 
 def _barra_lote(sel: pd.DataFrame, df_filtrado: pd.DataFrame, key: str, nome_export: str,
                 responsavel: str, sem_resp: bool):
     """Marca/desmarca várias notas de uma vez, num único salvamento."""
-    b_exp, b_info, b_obs, b_marca, b_desm = st.columns([2, 2, 3, 2, 2])
+    b_exp, b_info, b_obs, b_marca, b_desm = st.columns([2, 1.6, 3.4, 1.8, 1.4])
     with b_exp:
         btn_exportar(df_filtrado, nome_export)
     with b_info:
         st.markdown(f"**{len(sel)} notas selecionadas**")
     with b_obs:
-        obs = st.text_input("📝 Observação", key=f"obslote_{key}", label_visibility="collapsed",
+        obs = st.text_input("Observação", key=f"obslote_{key}", label_visibility="collapsed",
                             placeholder="Observação p/ todas (vazio mantém a atual)…")
     with b_marca:
-        marcar = st.button("✅ Marcar tratadas", type="primary", key=f"lote_ok_{key}",
+        marcar = st.button("Marcar tratadas", type="primary", key=f"lote_ok_{key}",
                            disabled=sem_resp, use_container_width=True)
     with b_desm:
-        desmarcar = st.button("↩️ Desmarcar", key=f"lote_undo_{key}",
+        desmarcar = st.button("Desmarcar", key=f"lote_undo_{key}",
                               disabled=sem_resp, use_container_width=True)
     if sem_resp:
-        st.warning("👤 Preencha o **Responsável pela alteração** na barra lateral para poder salvar.")
+        st.warning("Preencha o **Responsável pela alteração** no topo da página para poder salvar.")
     if not (marcar or desmarcar):
         return
 
@@ -1056,7 +1197,7 @@ def _barra_lote(sel: pd.DataFrame, df_filtrado: pd.DataFrame, key: str, nome_exp
 def render_detalhes_nf(df_nfs, cols_nfs, aba_real, sheet_names, erro):
     col_nf   = cols_nfs.get('col_nf')
     col_cnpj = cols_nfs.get('col_cnpj')
-    st.subheader("🔎 Detalhes por Nota Fiscal (busca global)")
+    st.markdown("##### Detalhes por nota fiscal (busca global)")
     if erro:
         st.error(f"Não consegui ler a aba de detalhes: {erro}")
         return
@@ -1123,18 +1264,17 @@ def remover_tratados(df: pd.DataFrame, df_controle: pd.DataFrame) -> pd.DataFram
     return df[~k.isin(chaves)].copy()
 
 
-def main():
-    with st.sidebar:
-        st.header("Auditoria")
-        responsavel = st.text_input("👤 Responsável pela alteração", key="responsavel")
-        st.divider()
-        if st.button("🔄 Forçar Recarga de Cache", type="primary", use_container_width=True):
-            st.cache_data.clear()
-            st.rerun()
-        if 'atualizado_em' in st.session_state:
-            st.caption(f"Sincronizado: {st.session_state['atualizado_em']}")
+def _kpi(label: str, valor: str, nota: str = '', cor: str = 'var(--border)') -> str:
+    nota_html = f'<div class="cb-kpi-nota">{nota}</div>' if nota else ''
+    return (f'<div class="cb-kpi" style="--kpi-cor:{cor}">'
+            f'<div class="cb-kpi-label" title="{html.escape(label)}">{html.escape(label)}</div>'
+            f'<div class="cb-kpi-valor">{html.escape(valor)}</div>{nota_html}</div>')
 
-    with st.spinner("Processando..."):
+def _fmt_int(n: int) -> str:
+    return f"{n:,}".replace(',', '.')
+
+def main():
+    with st.spinner("Carregando a planilha…"):
         raw = buscar_planilha_bytes()
         df_merge, df_pend, df_fora, df_excl = processar(raw)
         df_nfs, cols_nfs, aba_nfs, sheet_names, erro_nfs = carregar_nfs(raw)
@@ -1144,19 +1284,52 @@ def main():
     df_tratados = filtrar_tratados(df_merge, df_controle)
     df_pend_ativo = remover_tratados(df_pend, df_controle)
     df_merge_ativo = remover_tratados(df_merge, df_controle)
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Escopo Analítico", len(df_merge))
-    c2.metric("Pendências", len(df_pend_ativo))
-    c3.metric("Presentes na aba NFs", int((df_merge.get('Na NFs', pd.Series(dtype=str)) == 'Sim').sum()))
-    c4.metric("Descartados (Lógica de Negócio)", len(df_excl))
+
+    # ── PageHeader: título + responsável (auditoria) + recarregar ──
+    h_tit, h_resp, h_btn = st.columns([5, 3, 1.4])
+    with h_tit:
+        st.markdown(
+            '<div class="cb-brand">Cobli</div>'
+            '<h1 class="cb-title">Gestão de Manifestações NF-e</h1>'
+            f'<div class="cb-sub">Cruzamento SAP × Qive × NFs · sincronizado em {st.session_state["atualizado_em"]}</div>',
+            unsafe_allow_html=True,
+        )
+    with h_resp:
+        responsavel = st.text_input("Responsável pela alteração", key="responsavel",
+                                    placeholder="Seu nome (obrigatório para salvar)")
+    with h_btn:
+        st.markdown('<div style="height:28px"></div>', unsafe_allow_html=True)
+        if st.button("Recarregar dados", use_container_width=True,
+                     help="Limpa o cache e busca a planilha de novo"):
+            st.cache_data.clear()
+            st.rerun()
+
+    # ── KPIs ──
+    n_escopo = len(df_merge)
+    n_pend   = len(df_pend_ativo)
+    n_trat   = len(df_tratados)
+    n_nfs    = int((df_merge.get('Na NFs', pd.Series(dtype=str)) == 'Sim').sum())
+    valor_pend = sum(v for v in df_pend_ativo.get('Valor Nota Fiscal', pd.Series(dtype=str)).map(norm_valor)
+                     if v is not None)
+    pct_trat = f"{(n_trat / n_escopo * 100):.0f}%".replace('.', ',') if n_escopo else '—'
+    st.markdown(
+        '<div class="cb-kpis">'
+        + _kpi("Pendências", _fmt_int(n_pend), "notas aguardando manifestação", "var(--warning)")
+        + _kpi("Valor pendente", fmt_brl(valor_pend) or 'R$ 0,00', "soma das pendências", "var(--warning)")
+        + _kpi("Tratados", _fmt_int(n_trat), f"<b>{pct_trat}</b> do escopo", "var(--success)")
+        + _kpi("Escopo analítico", _fmt_int(n_escopo), f"{_fmt_int(n_nfs)} presentes na aba NFs", "var(--primary)")
+        + _kpi("Descartados", _fmt_int(len(df_excl)), "devolução, retorno, comodato", "var(--ring)")
+        + '</div>',
+        unsafe_allow_html=True,
+    )
 
     t1, t2, t_trat, t3, t4, t5 = st.tabs([
-        f"⚠️ Pendências ({len(df_pend_ativo)})",
-        f"📄 Notas SAP ({len(df_merge_ativo)})",
-        f"✅ Tratados ({len(df_tratados)})",
-        f"📂 Fora do Escopo ({len(df_fora)})",
-        f"📦 Excluídos ({len(df_excl)})",
-        "🔎 Detalhes da NF",
+        f"Pendências ({len(df_pend_ativo)})",
+        f"Notas SAP ({len(df_merge_ativo)})",
+        f"Tratados ({len(df_tratados)})",
+        f"Fora do escopo ({len(df_fora)})",
+        f"Excluídos ({len(df_excl)})",
+        "Detalhes da NF",
     ])
     with t1:
         render_editavel(df_pend_ativo, df_controle, df_nfs, cols_nfs, "pend", "pendencias", responsavel)
@@ -1165,10 +1338,12 @@ def main():
     with t_trat:
         render_editavel(df_tratados, df_controle, df_nfs, cols_nfs, "tratados", "tratados", responsavel)
     with t3:
-        st.dataframe(df_fora, hide_index=True, use_container_width=True)
+        st.caption("Notas que não são NF-e ou estão numa situação de manifestação fora da regra.")
+        st.dataframe(df_fora, hide_index=True, use_container_width=True, height=420)
         btn_exportar(df_fora, "fora_do_escopo")
     with t4:
-        st.dataframe(df_excl, hide_index=True, use_container_width=True)
+        st.caption("No escopo, mas descartadas pela regra de negócio (devolução, retorno, comodato ou CFOP de retorno).")
+        st.dataframe(df_excl, hide_index=True, use_container_width=True, height=420)
         btn_exportar(df_excl, "excluidos")
     with t5:
         render_detalhes_nf(df_nfs, cols_nfs, aba_nfs, sheet_names, erro_nfs)
